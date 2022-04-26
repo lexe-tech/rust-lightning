@@ -15,7 +15,7 @@
 
 use core::hash;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use lightning::ln::peer_handler::SocketDescriptor;
@@ -59,6 +59,13 @@ impl Read for TcpReader {
         self.0.read(buf)
     }
 }
+impl TcpReader {
+    /// Shuts down the read half of the underlying TcpStream.
+    /// The write half needs to be shutdown separately.
+    fn shutdown(&self) -> std::io::Result<()> {
+        self.0.shutdown(Shutdown::Read)
+    }
+}
 
 /// A TcpStream that can (and should) only be used for writing
 struct TcpWriter(TcpStream);
@@ -68,6 +75,13 @@ impl Write for TcpWriter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()
+    }
+}
+impl TcpWriter {
+    /// Shuts down the write half of the underlying TcpStream.
+    /// The read half needs to be shutdown separately.
+    fn shutdown(&self) -> std::io::Result<()> {
+        self.0.shutdown(Shutdown::Write)
     }
 }
 
@@ -88,7 +102,6 @@ impl Connection {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
