@@ -5,7 +5,7 @@ authors = ["Matt Corallo"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lightningdevkit/rust-lightning/"
 description = """
-Implementation of the rust-lightning network stack without Tokio.
+Implementation of the rust-lightning network stack for a synchronous runtime.
 For Rust-Lightning clients which wish to make direct connections to Lightning
 P2P nodes, this is a simple alternative to implementing the required network
 stack for those who do not want to use Tokio.
@@ -19,3 +19,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 bitcoin = "0.27"
 lightning = { version = "0.0.106", path = "../lightning" }
+crossbeam-channel = "0.5"

@@ -26,6 +26,7 @@
 //! # TODO
 
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(clippy::type_complexity)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![allow(dead_code)] // TODO: Remove when complete
 
@@ -34,7 +35,9 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
+
+use crossbeam_channel::{Receiver, Sender};
 
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
 use lightning::ln::peer_handler::{
@@ -50,13 +53,10 @@ use lightning::util::logger::Logger;
 /// If the PeerManager accepts the connection, this function returns Ok with a
 /// std::thread::JoinHandle<()> for the thread managing the connection in case
 /// there is some need to `join` on it.
-///
-/// If the PeerManager rejects the connection, this function returns the
-/// associated PeerHandleError.
 pub fn spawn_inbound_handler<CMH, RMH, L, UMH>(
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     stream: TcpStream,
-) -> Result<JoinHandle<()>, PeerHandleError>
+) -> Result<(), PeerHandleError>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
     RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -64,9 +64,9 @@ where
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
     let ip_addr = stream.peer_addr().unwrap();
-    let conn = Connection::from_std_stream(stream);
+    let (conn, write_tx) = Connection::init(stream);
     let am_conn = Arc::new(Mutex::new(conn));
-    let socket_descriptor = SyncSocketDescriptor::from_connection(am_conn.clone());
+    let mut socket_descriptor = SyncSocketDescriptor::from_connection(am_conn, &write_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -79,23 +79,22 @@ where
         },
     };
 
-    // Notify the PeerManager of the new inbound connection
+    // Notify the PeerManager of the new inbound connection.
     peer_manager
-        .new_inbound_connection(socket_descriptor, Some(net_address))
-        .map(|_| {
-            // PeerManager accepted; spawn the handler thread
-            thread::spawn(move || {
-                // TODO: Implement the equivalent of Connection::schedule_read()
-                unimplemented!();
-            })
+        .new_inbound_connection(socket_descriptor.clone(), Some(net_address))
+        .map_err(|e| {
+            // PeerManager rejected this connection, disconnect
+            socket_descriptor.disconnect_socket();
+            e
         })
 }
 
 /// An synchronous SocketDescriptor (i.e. it doesn't rely on Tokio)
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
-    conn: Arc<Mutex<Connection>>,
     id: u64,
+    am_conn: Arc<Mutex<Connection>>,
+    write_tx: Sender<Vec<u8>>,
 }
 impl PartialEq for SyncSocketDescriptor {
     fn eq(&self, other: &Self) -> bool {
@@ -109,9 +108,15 @@ impl hash::Hash for SyncSocketDescriptor {
     }
 }
 impl SyncSocketDescriptor {
-    fn from_connection(conn: Arc<Mutex<Connection>>) -> Self {
-        let id = conn.lock().unwrap().id;
-        Self { conn, id }
+    fn from_connection(am_conn: Arc<Mutex<Connection>>, write_tx: &Sender<Vec<u8>>) -> Self {
+        let id = am_conn.lock().unwrap().id;
+        let write_tx = write_tx.clone();
+
+        Self {
+            id,
+            am_conn,
+            write_tx,
+        }
     }
 }
 impl SocketDescriptor for SyncSocketDescriptor {
@@ -120,11 +125,13 @@ impl SocketDescriptor for SyncSocketDescriptor {
             return 0;
         }
 
+        // TODO: try_send() on write_tx
+
         unimplemented!();
     }
 
     fn disconnect_socket(&mut self) {
-        unimplemented!();
+        self.am_conn.lock().unwrap().disconnect();
     }
 }
 
@@ -133,35 +140,79 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Connection holds all the internal state for a connection.
 struct Connection {
     id: u64,
-    reader: TcpReader,
-    writer: TcpWriter,
     /// Whether reads are paused. See send_data() docs
     read_paused: bool,
 }
 impl Connection {
-    /// Generates a new Connection given an existing TcpStream.
-    /// The given stream is split into a read half and write half.
-    /// The read and write halves are are returned as new types to help prevent
-    /// future implementers from accidentally calling read() on the writer
-    /// half and vice versa.
-    fn from_std_stream(original: TcpStream) -> Self {
+    /// Generates a new Connection given an existing TcpStream and spawns the
+    /// processing threads for ConnectionReader and ConnectionWriter.
+    ///
+    /// Additionally returns a `write_tx` which can be used to pass data to the
+    /// ConnectionWriter to send over TCP.
+    fn init(original: TcpStream) -> (Self, Sender<Vec<u8>>) {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
         let clone = original.try_clone().expect("Clone failed");
-        Self {
+
+        let tcp_reader = TcpReader(original);
+        let tcp_writer = TcpWriter(clone);
+        let reader = ConnectionReader::from_tcp_reader(tcp_reader);
+        let (writer, write_tx) = ConnectionWriter::from_tcp_writer(tcp_writer);
+
+        // Spawn the reader and writer threads
+        thread::spawn(move || reader.run());
+        thread::spawn(move || writer.run());
+
+        let me = Self {
             id,
-            reader: TcpReader(original),
-            writer: TcpWriter(clone),
             read_paused: false,
-        }
+        };
+
+        (me, write_tx)
     }
 
-    /// Spawn a
-    fn manage() {
-        // TODO: Join on the two threads ending
+    fn disconnect(&self) {
+        unimplemented!();
     }
 }
 
-/// A TcpStream that can (and should) only be used for reading
+struct ConnectionReader {
+    inner: TcpReader,
+}
+impl ConnectionReader {
+    fn from_tcp_reader(reader: TcpReader) -> Self {
+        Self { inner: reader }
+    }
+
+    fn run(&self) {
+        unimplemented!()
+    }
+}
+
+struct ConnectionWriter {
+    inner: TcpWriter,
+    write_rx: Receiver<Vec<u8>>,
+}
+impl ConnectionWriter {
+    /// Generates a ConnectionWriter and associated `write_tx` from a TcpWriter
+    fn from_tcp_writer(writer: TcpWriter) -> (Self, Sender<Vec<u8>>) {
+        // Only one Vec<u8> can be in the channel at a time.
+        // This way, senders can tell whether previous writes are still
+        // processing by calling tx.is_full()
+        let (write_tx, write_rx) = crossbeam_channel::bounded(1);
+        let me = Self {
+            inner: writer,
+            write_rx,
+        };
+
+        (me, write_tx)
+    }
+
+    fn run(&self) {
+        unimplemented!()
+    }
+}
+
+/// A newtype for a TcpStream that can (and should) only be used for reading
 struct TcpReader(TcpStream);
 impl Read for TcpReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -176,7 +227,7 @@ impl TcpReader {
     }
 }
 
-/// A TcpStream that can (and should) only be used for writing
+/// A newtype for a TcpStream that can (and should) only be used for writing
 struct TcpWriter(TcpStream);
 impl Write for TcpWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -229,7 +280,7 @@ mod tests {
     #[test]
     fn basic_test() {
         let (client, _server) = create_connection();
-        let _client_conn = Connection::from_std_stream(client);
+        let _client_conn = Connection::init(client);
 
         // client_conn.reader.write();
         // client_conn.reader.0.write();
