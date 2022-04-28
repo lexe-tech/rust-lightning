@@ -25,9 +25,8 @@
 //! ## Overview of Channels in this crate
 //!
 //! - (`write_data_tx`, `write_data_rx`): A channel of `Vec<u8>`s with size 1
-//!   from a [`SyncSocketDescriptor`] (multiple) to a [`ConnectionWriter`]
-//!   (singular) used for sending data to the [`ConnectionWriter`] to send to
-//!   the peer.
+//!   from a [`SyncSocketDescriptor`] (multiple) to a [`Writer`] (singular) used
+//!   for sending data to the [`Writer`] to send to the peer.
 //! - TODO complete
 //!
 //! # Example Usage
@@ -164,7 +163,7 @@ struct Connection {
 }
 impl Connection {
     /// Generates a new Connection given an existing TcpStream and spawns
-    /// processing threads for ConnectionReader and ConnectionWriter.
+    /// processing threads for Reader and Writer.
     ///
     /// Reads and writes are blocking, so reading and writing is done on
     /// separate threads to prevent reads from blocking writes and vice versa.
@@ -176,7 +175,7 @@ impl Connection {
     /// private tuple fields still being readable by the impls in this file.
     ///
     /// init() additionally returns a `write_data_tx` which can be used to pass
-    /// data to the ConnectionWriter to send over TCP.
+    /// data to the Writer to send over TCP.
     /// TODO: Add another Arc<PeerManager> here which can be passed into the
     /// reader and writer threads
     fn init<CMH, RMH, L, UMH>(
@@ -192,15 +191,11 @@ impl Connection {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
         let cloned_stream = original_stream.try_clone().expect("Clone failed");
 
-        let (mut writer, write_data_tx) =
-            ConnectionWriter::from_tcp_writer(TcpWriter(cloned_stream));
+        let (mut writer, write_data_tx) = Writer::from_tcp_writer(TcpWriter(cloned_stream));
         let socket_descriptor = SyncSocketDescriptor::from_connection_id(id, &write_data_tx);
 
-        let mut reader: ConnectionReader<CMH, RMH, L, UMH> = ConnectionReader::from_tcp_reader(
-            TcpReader(original_stream),
-            peer_manager,
-            socket_descriptor,
-        );
+        let mut reader: Reader<CMH, RMH, L, UMH> =
+            Reader::from_tcp_reader(TcpReader(original_stream), peer_manager, socket_descriptor);
 
         // Spawn the reader and writer threads
         thread::spawn(move || reader.run());
@@ -219,7 +214,7 @@ impl Connection {
     }
 }
 
-struct ConnectionReader<CMH, RMH, L, UMH>
+struct Reader<CMH, RMH, L, UMH>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
     RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -231,7 +226,7 @@ where
     descriptor: SyncSocketDescriptor,
     read_paused: bool,
 }
-impl<CMH, RMH, L, UMH> ConnectionReader<CMH, RMH, L, UMH>
+impl<CMH, RMH, L, UMH> Reader<CMH, RMH, L, UMH>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
     RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -286,10 +281,10 @@ where
     }
 }
 
-struct ConnectionWriter {
+struct Writer {
     inner: TcpWriter,
     write_data_rx: Receiver<Vec<u8>>,
-    /// An internal buffer which stores the data that the ConnectionWriter is
+    /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
     ///
     /// This buffer is necessary because calls to self.inner.write() may fail or
@@ -306,22 +301,22 @@ struct ConnectionWriter {
     /// .drain() which respectively incur the cost of an additional Vec
     /// allocation or data move.
     ///
-    /// ConnectionWriter code must maintain the invariant that
+    /// Writer code must maintain the invariant that
     /// `start < buf.len()`. If `start == buf.len()`, the value of `buf` should
     /// be `None`.
     start: usize,
 }
-impl ConnectionWriter {
-    /// Generates a ConnectionWriter and associated `write_data_tx` from a
+impl Writer {
+    /// Generates a Writer and associated `write_data_tx` from a
     /// TcpWriter
     fn from_tcp_writer(writer: TcpWriter) -> (Self, Sender<Vec<u8>>) {
         // Only one Vec<u8> can be in the channel at a time. This way, senders
         // can know that previous writes are still processing when tx.is_full()
         // returns true.
         //
-        // This channel between the ConnectionWriter and the holders of the
+        // This channel between the Writer and the holders of the
         // Sender<Vec<u8>>s can be thought of as a second buffer, where the
-        // first buffer is the ConnectionWriter internal buffer (`self.buf`) and
+        // first buffer is the Writer internal buffer (`self.buf`) and
         // the third buffer is the &[u8] passed into send_data().
         let (write_data_tx, write_data_rx) = crossbeam::channel::bounded(1);
         let me = Self {
@@ -364,7 +359,7 @@ impl ConnectionWriter {
                                 // disconnect.
                                 break;
                             } else {
-                                panic!("Unhandled case in ConnectionWriter::run()");
+                                panic!("Unhandled case in Writer::run()");
                             }
                         }
                         Err(_) => {
