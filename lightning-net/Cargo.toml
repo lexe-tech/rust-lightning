@@ -19,4 +19,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 bitcoin = "0.27"
 lightning = { version = "0.0.106", path = "../lightning" }
-crossbeam-channel = "0.5"
+crossbeam = "0.8.1"

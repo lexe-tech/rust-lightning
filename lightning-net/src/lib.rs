@@ -22,6 +22,13 @@
 //! Those who want to run rust-lightning with a synchronous runtime, smaller
 //! code size, or no dependency or Tokio, should use this crate.
 //!
+//! ## Overview of Channels in this crate
+//!
+//! - (`write_tx`, `write_rx`): A channel of `Vec<u8>`s with size 1 from a
+//!   [`SyncSocketDescriptor`] (multiple) to a [`ConnectionWriter`] (singular)
+//!   used for sending data to the [`ConnectionWriter`] to send to the peer.
+//! - TODO complete
+//!
 //! # Example Usage
 //! # TODO
 
@@ -37,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender};
 
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
 use lightning::ln::peer_handler::{
@@ -83,7 +90,7 @@ where
     peer_manager
         .new_inbound_connection(socket_descriptor.clone(), Some(net_address))
         .map_err(|e| {
-            // PeerManager rejected this connection, disconnect
+            // PeerManager rejected this connection; disconnect
             socket_descriptor.disconnect_socket();
             e
         })
@@ -127,36 +134,57 @@ impl SocketDescriptor for SyncSocketDescriptor {
 
         // TODO: try_send() on write_tx
 
+        // The data must be copied here since a &[u8] reference cannot be sent
+        // across threads, and a synchronous runtime requires dedicated threads
+        // for reading and writing.
+        // This copying
+        // introduces a small amount of overhead. For a
+        // zero-copy implementation, use `lightning-net-tokio`.
+
         unimplemented!();
     }
 
     fn disconnect_socket(&mut self) {
+        // NOTE: Could send directly to reader / writer of this Connection
+
         self.am_conn.lock().unwrap().disconnect();
     }
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Connection holds all the internal state for a connection.
+/// Represents a TCP connection to a peer.
+///
+/// There should only be one `Connection` struct per TCP connection
+/// (hence by init() takes ownership of the underlying TcpStream).
 struct Connection {
     id: u64,
     /// Whether reads are paused. See send_data() docs
     read_paused: bool,
 }
 impl Connection {
-    /// Generates a new Connection given an existing TcpStream and spawns the
-    /// processing threads for ConnectionReader and ConnectionWriter.
+    /// Generates a new Connection given an existing TcpStream and spawns a
+    /// processing thread for ConnectionReader and ConnectionWriter.
     ///
-    /// Additionally returns a `write_tx` which can be used to pass data to the
-    /// ConnectionWriter to send over TCP.
+    /// Reads and writes are blocking, so reading and writing is done on
+    /// separate threads to prevent reads from blocking writes and vice versa.
+    ///
+    /// To achieve this, internally, the TcpStream is cloned and split into a
+    /// TcpReader and TcpWriter. The TcpReader and TcpWriter newtypes are used
+    /// to reinforce that they *should* only used for reading and writing
+    /// respectively, but this is not enforced by the compiler due to their
+    /// private tuple fields still being readable by the impls in this file.
+    ///
+    /// init() additionally returns a `write_tx` which can be used to pass data
+    /// to the ConnectionWriter to send over TCP.
+    /// TODO: Add another Arc<PeerManager> here which can be passed into the
+    /// reader and writer threads
     fn init(original: TcpStream) -> (Self, Sender<Vec<u8>>) {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
         let clone = original.try_clone().expect("Clone failed");
 
-        let tcp_reader = TcpReader(original);
-        let tcp_writer = TcpWriter(clone);
-        let reader = ConnectionReader::from_tcp_reader(tcp_reader);
-        let (writer, write_tx) = ConnectionWriter::from_tcp_writer(tcp_writer);
+        let reader = ConnectionReader::from_tcp_reader(TcpReader(original));
+        let (mut writer, write_tx) = ConnectionWriter::from_tcp_writer(TcpWriter(clone));
 
         // Spawn the reader and writer threads
         thread::spawn(move || reader.run());
@@ -191,24 +219,110 @@ impl ConnectionReader {
 struct ConnectionWriter {
     inner: TcpWriter,
     write_rx: Receiver<Vec<u8>>,
+    /// An internal buffer which stores the data that the ConnectionWriter is
+    /// currently attempting to write.
+    ///
+    /// This buffer is necessary because calls to self.inner.write() may fail or
+    /// may write only part of the data.
+    buf: Option<Vec<u8>>,
+    /// The starting index into buf that specifies where in the buffer the next
+    /// attempt should start.
+    ///
+    /// Partial writes are accounted for by incrementing the start index by the
+    /// number of bytes written, while full writes reset `buf` back to None and
+    /// the start index back to 0.
+    ///
+    /// Using this start index avoids the need to call buf.split_off() or
+    /// .drain() which respectively incur the cost of an additional Vec
+    /// allocation or data move.
+    ///
+    /// ConnectionWriter code must maintain the invariant that
+    /// `start < buf.len()`. If `start == buf.len()`, the value of `buf` should
+    /// be `None`.
+    start: usize,
 }
 impl ConnectionWriter {
     /// Generates a ConnectionWriter and associated `write_tx` from a TcpWriter
     fn from_tcp_writer(writer: TcpWriter) -> (Self, Sender<Vec<u8>>) {
-        // Only one Vec<u8> can be in the channel at a time.
-        // This way, senders can tell whether previous writes are still
-        // processing by calling tx.is_full()
-        let (write_tx, write_rx) = crossbeam_channel::bounded(1);
+        // Only one Vec<u8> can be in the channel at a time. This way, senders
+        // can know that previous writes are still processing when tx.is_full()
+        // returns true.
+        //
+        // This channel between the ConnectionWriter and the holders of the
+        // Sender<Vec<u8>>s can be thought of as a second buffer, where the
+        // first buffer is the ConnectionWriter internal buffer (`self.buf`) and
+        // the third buffer is the &[u8] passed into send_data().
+        let (write_tx, write_rx) = crossbeam::channel::bounded(1);
         let me = Self {
             inner: writer,
             write_rx,
+            buf: None,
+            start: 0,
         };
 
         (me, write_tx)
     }
 
-    fn run(&self) {
-        unimplemented!()
+    // TODO: Write comment describing this function
+    fn run(&mut self) {
+        loop {
+            match &self.buf {
+                Some(buf) => {
+                    // We have data in our internal buffer; attempt to write it
+                    match self.inner.write(&buf[self.start..]) {
+                        Ok(bytes_written) => {
+                            // Define end s.t. the data written was buf[start..end]
+                            let end = self.start + bytes_written;
+
+                            if end == buf.len() {
+                                // Everything was written, clear the buf and reset the start index
+                                self.buf = None;
+                                self.start = 0;
+                            } else if bytes_written > 0 && end < buf.len() {
+                                // Partial write; the new start index is exactly where the current
+                                // write ended.
+                                self.start = end;
+                            } else if bytes_written == 0 {
+                                // We received Ok, but nothing was written.
+                                //
+                                // Either the peer closed their read half only (unlikely) or the peer
+                                // disconnected from us and we heard about it through our failed
+                                // write (more likely). Break the loop so that we can send a
+                                // disconnect.
+                                break;
+                            } else {
+                                panic!("Unhandled case in ConnectionWriter::run()");
+                            }
+                        }
+                        Err(_) => {
+                            // Write attempt errored; try again without updating
+                            // the start index
+                        }
+                    }
+                }
+                None => {
+                    // We don't have data in our internal buffer; fetch more
+                    match self.write_rx.recv() {
+                        Ok(data) => {
+                            if data.len() > 0 {
+                                // Data fetched, add it to the buffer
+                                self.buf = Some(data);
+                                self.start = 0;
+                            }
+                        }
+                        Err(_) => {
+                            // Channel is empty and disconnected
+                            // => no more messages can be sent
+                            // => break the loop and shut down the write half of the TcpStream
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wrapping up: shut down the TcpStream
+        let _ = self.inner.shutdown();
     }
 }
 
