@@ -73,7 +73,8 @@ where
     let ip_addr = stream.peer_addr().unwrap();
     let (conn, write_tx) = Connection::init(stream, peer_manager.clone());
     let am_conn = Arc::new(Mutex::new(conn));
-    let mut socket_descriptor = SyncSocketDescriptor::from_connection(am_conn, &write_tx);
+    let conn_id = { am_conn.lock().unwrap().id };
+    let mut socket_descriptor = SyncSocketDescriptor::from_connection_id(conn_id, &write_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -100,7 +101,6 @@ where
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
-    am_conn: Arc<Mutex<Connection>>,
     write_tx: Sender<Vec<u8>>,
 }
 impl PartialEq for SyncSocketDescriptor {
@@ -115,13 +115,11 @@ impl hash::Hash for SyncSocketDescriptor {
     }
 }
 impl SyncSocketDescriptor {
-    fn from_connection(am_conn: Arc<Mutex<Connection>>, write_tx: &Sender<Vec<u8>>) -> Self {
-        let id = am_conn.lock().unwrap().id;
+    fn from_connection_id(connection_id: u64, write_tx: &Sender<Vec<u8>>) -> Self {
         let write_tx = write_tx.clone();
 
         Self {
-            id,
-            am_conn,
+            id: connection_id,
             write_tx,
         }
     }
@@ -146,8 +144,6 @@ impl SocketDescriptor for SyncSocketDescriptor {
 
     fn disconnect_socket(&mut self) {
         // NOTE: Could send directly to reader / writer of this Connection
-
-        self.am_conn.lock().unwrap().disconnect();
     }
 }
 
@@ -180,7 +176,7 @@ impl Connection {
     /// TODO: Add another Arc<PeerManager> here which can be passed into the
     /// reader and writer threads
     fn init<CMH, RMH, L, UMH>(
-        original: TcpStream,
+        original_stream: TcpStream,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     ) -> (Self, Sender<Vec<u8>>)
     where
@@ -190,11 +186,16 @@ impl Connection {
         UMH: CustomMessageHandler + 'static + Send + Sync,
     {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
-        let clone = original.try_clone().expect("Clone failed");
+        let cloned_stream = original_stream.try_clone().expect("Clone failed");
 
-        let mut reader: ConnectionReader<CMH, RMH, L, UMH> =
-            ConnectionReader::from_tcp_reader(TcpReader(original), peer_manager);
-        let (mut writer, write_tx) = ConnectionWriter::from_tcp_writer(TcpWriter(clone));
+        let (mut writer, write_tx) = ConnectionWriter::from_tcp_writer(TcpWriter(cloned_stream));
+        let socket_descriptor = SyncSocketDescriptor::from_connection_id(id, &write_tx);
+
+        let mut reader: ConnectionReader<CMH, RMH, L, UMH> = ConnectionReader::from_tcp_reader(
+            TcpReader(original_stream),
+            peer_manager,
+            socket_descriptor,
+        );
 
         // Spawn the reader and writer threads
         thread::spawn(move || reader.run());
@@ -233,6 +234,7 @@ where
     fn from_tcp_reader(
         reader: TcpReader,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+        _socket_descriptor: SyncSocketDescriptor,
     ) -> Self {
         Self {
             inner: reader,
@@ -254,7 +256,6 @@ where
                     break;
                 }
                 Ok(_len) => {
-                    // TODO get a socket descriptor in here
                     // peer_manager.read_event()
                 }
             }
