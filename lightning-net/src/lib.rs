@@ -130,6 +130,9 @@ impl SocketDescriptor for SyncSocketDescriptor {
             return 0;
         }
 
+        // Get a reader_cmd_tx in here
+        // TODO Unpause reading when resume_read == true
+
         // TODO: try_send() on write_tx
 
         // The data must be copied here since a &[u8] reference cannot be sent
@@ -171,8 +174,8 @@ impl Connection {
     /// respectively, but this is not enforced by the compiler due to their
     /// private tuple fields still being readable by the impls in this file.
     ///
-    /// init() additionally returns a `write_tx` which can be used to pass data
-    /// to the ConnectionWriter to send over TCP.
+    /// init() additionally returns a `write_tx` which can be used to pass
+    /// data to the ConnectionWriter to send over TCP.
     /// TODO: Add another Arc<PeerManager> here which can be passed into the
     /// reader and writer threads
     fn init<CMH, RMH, L, UMH>(
@@ -223,6 +226,8 @@ where
 {
     inner: TcpReader,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    descriptor: SyncSocketDescriptor,
+    read_paused: bool,
 }
 impl<CMH, RMH, L, UMH> ConnectionReader<CMH, RMH, L, UMH>
 where
@@ -234,20 +239,21 @@ where
     fn from_tcp_reader(
         reader: TcpReader,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
-        _socket_descriptor: SyncSocketDescriptor,
+        descriptor: SyncSocketDescriptor,
     ) -> Self {
         Self {
             inner: reader,
             peer_manager,
+            descriptor,
+            read_paused: false,
         }
     }
 
+    // TODO write function description
     fn run(&mut self) {
         // 8KB is nice and big but also should never cause any issues with stack
         // overflowing.
         let mut buf = [0; 8192];
-
-        // TODO implement read_paused
 
         loop {
             match self.inner.read(&mut buf) {
@@ -255,8 +261,21 @@ where
                     // Peer disconnected
                     break;
                 }
-                Ok(_len) => {
-                    // peer_manager.read_event()
+                Ok(bytes_read) => {
+                    match self
+                        .peer_manager
+                        .read_event(&mut self.descriptor, &buf[0..bytes_read])
+                    {
+                        Ok(pause_read) => {
+                            if pause_read {
+                                self.read_paused = true;
+                            }
+                        }
+                        Err(_) => {
+                            // TODO disconnect
+                            unimplemented!();
+                        }
+                    }
                 }
             }
         }
@@ -291,7 +310,8 @@ struct ConnectionWriter {
     start: usize,
 }
 impl ConnectionWriter {
-    /// Generates a ConnectionWriter and associated `write_tx` from a TcpWriter
+    /// Generates a ConnectionWriter and associated `write_tx` from a
+    /// TcpWriter
     fn from_tcp_writer(writer: TcpWriter) -> (Self, Sender<Vec<u8>>) {
         // Only one Vec<u8> can be in the channel at a time. This way, senders
         // can know that previous writes are still processing when tx.is_full()
