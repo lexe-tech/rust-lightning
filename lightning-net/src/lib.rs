@@ -299,29 +299,51 @@ where
         let mut buf = [0; 8192];
 
         loop {
-            // TODO handle ResumeRead command
-            // if let Ok(()) = self.resume_read_rx.try_recv() {
-            // }
-
-            match self.inner.read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    // Peer disconnected
-                    break;
+            if self.read_paused {
+                // To avoid a busy loop while reading is paused, block on the
+                // resume_read channel until we are told to resume reading again
+                // or until all channel senders are dropped (in which case we
+                // will shut down).
+                match self.resume_read_rx.recv() {
+                    Ok(()) => {
+                        // Resume reading
+                        self.read_paused = false;
+                    }
+                    Err(_) => {
+                        // The channel is disconnected, break and shut down
+                        break;
+                    }
                 }
-                Ok(bytes_read) => {
-                    match self
-                        .peer_manager
-                        .read_event(&mut self.descriptor, &buf[0..bytes_read])
-                    {
-                        Ok(pause_read) => {
-                            if pause_read {
-                                self.read_paused = true;
+            } else {
+                // Reading is not paused; block on the next read.
+                // If the SyncSocketDescriptor disconnects the underlying TcpStream,
+                // the Reader will read Ok(0) or Err, in which case we know to
+                // break the loop and shut down.
+                match self.inner.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        // Peer disconnected
+                        break;
+                    }
+                    Ok(bytes_read) => {
+                        // Register the read event with the PeerManager
+                        match self
+                            .peer_manager
+                            .read_event(&mut self.descriptor, &buf[0..bytes_read])
+                        {
+                            Ok(pause_read) => {
+                                if pause_read {
+                                    self.read_paused = true;
+                                }
+                            }
+                            Err(_) => {
+                                // Rust-Lightning told us to disconnect; do it
+                                // TODO
+                                unimplemented!();
                             }
                         }
-                        Err(_) => {
-                            // TODO disconnect
-                            unimplemented!();
-                        }
+
+                        // TODO as noted in the docs for read_event(), we need
+                        // to call process_events().
                     }
                 }
             }
