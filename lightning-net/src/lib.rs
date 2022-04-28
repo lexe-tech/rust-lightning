@@ -7,8 +7,8 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! A socket handling library for those using rust-lightning within a synchronous,
-//! multi-threaded runtime, including inside SGX.
+//! A socket handling library for those using rust-lightning within a
+//! synchronous, multi-threaded runtime, including inside SGX.
 //!
 //! Whereas `lightning-net-tokio` manages reading and writing to peers using
 //! Futures and Tokio tasks, this library uses dedicated blocking threads. While
@@ -71,7 +71,7 @@ where
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
     let ip_addr = stream.peer_addr().unwrap();
-    let (conn, write_tx) = Connection::init(stream);
+    let (conn, write_tx) = Connection::init(stream, peer_manager.clone());
     let am_conn = Arc::new(Mutex::new(conn));
     let mut socket_descriptor = SyncSocketDescriptor::from_connection(am_conn, &write_tx);
 
@@ -163,8 +163,8 @@ struct Connection {
     read_paused: bool,
 }
 impl Connection {
-    /// Generates a new Connection given an existing TcpStream and spawns a
-    /// processing thread for ConnectionReader and ConnectionWriter.
+    /// Generates a new Connection given an existing TcpStream and spawns
+    /// processing threads for ConnectionReader and ConnectionWriter.
     ///
     /// Reads and writes are blocking, so reading and writing is done on
     /// separate threads to prevent reads from blocking writes and vice versa.
@@ -179,11 +179,21 @@ impl Connection {
     /// to the ConnectionWriter to send over TCP.
     /// TODO: Add another Arc<PeerManager> here which can be passed into the
     /// reader and writer threads
-    fn init(original: TcpStream) -> (Self, Sender<Vec<u8>>) {
+    fn init<CMH, RMH, L, UMH>(
+        original: TcpStream,
+        peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    ) -> (Self, Sender<Vec<u8>>)
+    where
+        CMH: ChannelMessageHandler + 'static + Send + Sync,
+        RMH: RoutingMessageHandler + 'static + Send + Sync,
+        L: Logger + 'static + ?Sized + Send + Sync,
+        UMH: CustomMessageHandler + 'static + Send + Sync,
+    {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
         let clone = original.try_clone().expect("Clone failed");
 
-        let reader = ConnectionReader::from_tcp_reader(TcpReader(original));
+        let mut reader: ConnectionReader<CMH, RMH, L, UMH> =
+            ConnectionReader::from_tcp_reader(TcpReader(original), peer_manager);
         let (mut writer, write_tx) = ConnectionWriter::from_tcp_writer(TcpWriter(clone));
 
         // Spawn the reader and writer threads
@@ -203,16 +213,54 @@ impl Connection {
     }
 }
 
-struct ConnectionReader {
+struct ConnectionReader<CMH, RMH, L, UMH>
+where
+    CMH: ChannelMessageHandler + 'static + Send + Sync,
+    RMH: RoutingMessageHandler + 'static + Send + Sync,
+    L: Logger + 'static + ?Sized + Send + Sync,
+    UMH: CustomMessageHandler + 'static + Send + Sync,
+{
     inner: TcpReader,
+    peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
 }
-impl ConnectionReader {
-    fn from_tcp_reader(reader: TcpReader) -> Self {
-        Self { inner: reader }
+impl<CMH, RMH, L, UMH> ConnectionReader<CMH, RMH, L, UMH>
+where
+    CMH: ChannelMessageHandler + 'static + Send + Sync,
+    RMH: RoutingMessageHandler + 'static + Send + Sync,
+    L: Logger + 'static + ?Sized + Send + Sync,
+    UMH: CustomMessageHandler + 'static + Send + Sync,
+{
+    fn from_tcp_reader(
+        reader: TcpReader,
+        peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    ) -> Self {
+        Self {
+            inner: reader,
+            peer_manager,
+        }
     }
 
-    fn run(&self) {
-        unimplemented!()
+    fn run(&mut self) {
+        // 8KB is nice and big but also should never cause any issues with stack
+        // overflowing.
+        let mut buf = [0; 8192];
+
+        // TODO implement read_paused
+
+        loop {
+            match self.inner.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    // Peer disconnected
+                    break;
+                }
+                Ok(_len) => {
+                    // TODO get a socket descriptor in here
+                    // peer_manager.read_event()
+                }
+            }
+        }
+
+        unimplemented!();
     }
 }
 
@@ -264,6 +312,7 @@ impl ConnectionWriter {
     }
 
     // TODO: Write comment describing this function
+    #[allow(clippy::single_match)]
     fn run(&mut self) {
         loop {
             match &self.buf {
@@ -285,8 +334,9 @@ impl ConnectionWriter {
                             } else if bytes_written == 0 {
                                 // We received Ok, but nothing was written.
                                 //
-                                // Either the peer closed their read half only (unlikely) or the peer
-                                // disconnected from us and we heard about it through our failed
+                                // Either the peer closed their read half only (unlikely) or the
+                                // peer disconnected from us and we
+                                // heard about it through our failed
                                 // write (more likely). Break the loop so that we can send a
                                 // disconnect.
                                 break;
@@ -304,7 +354,7 @@ impl ConnectionWriter {
                     // We don't have data in our internal buffer; fetch more
                     match self.write_rx.recv() {
                         Ok(data) => {
-                            if data.len() > 0 {
+                            if !data.is_empty() {
                                 // Data fetched, add it to the buffer
                                 self.buf = Some(data);
                                 self.start = 0;
@@ -361,14 +411,14 @@ impl TcpWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::Connection;
+    // use super::Connection;
     use std::net::{TcpListener, TcpStream};
 
     fn create_connection() -> (TcpStream, TcpStream) {
-        // We bind on localhost, hoping the environment is properly configured with a local
-        // address. This may not always be the case in containers and the like, so if this test is
-        // failing for you check that you have a loopback interface and it is configured with
-        // 127.0.0.1.
+        // We bind on localhost, hoping the environment is properly configured with a
+        // local address. This may not always be the case in containers and the
+        // like, so if this test is failing for you check that you have a
+        // loopback interface and it is configured with 127.0.0.1.
         let (client, server) = if let Ok(server) = TcpListener::bind("127.0.0.1:9735") {
             (
                 TcpStream::connect("127.0.0.1:9735").unwrap(),
@@ -393,8 +443,8 @@ mod tests {
 
     #[test]
     fn basic_test() {
-        let (client, _server) = create_connection();
-        let _client_conn = Connection::init(client);
+        let (_client, _server) = create_connection();
+        // let _client_conn = Connection::init(client);
 
         // client_conn.reader.write();
         // client_conn.reader.0.write();
