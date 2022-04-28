@@ -78,7 +78,7 @@ where
     let (resume_read_tx, resume_read_rx) = crossbeam::channel::unbounded();
 
     let ip_addr = stream.peer_addr().unwrap();
-    let (conn, write_data_tx) = Connection::init(
+    let (conn, disconnectooor, write_data_tx) = Connection::init(
         stream,
         peer_manager.clone(),
         resume_read_tx.clone(),
@@ -86,7 +86,8 @@ where
     );
     let am_conn = Arc::new(Mutex::new(conn));
     let conn_id = { am_conn.lock().unwrap().id };
-    let mut socket_descriptor = SyncSocketDescriptor::new(conn_id, resume_read_tx, write_data_tx);
+    let mut socket_descriptor =
+        SyncSocketDescriptor::new(conn_id, disconnectooor, resume_read_tx, write_data_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -117,6 +118,7 @@ where
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
+    tcp_disconnector: TcpDisconnectooor,
     resume_read_tx: Sender<()>,
     write_data_tx: Sender<Vec<u8>>,
 }
@@ -132,9 +134,15 @@ impl hash::Hash for SyncSocketDescriptor {
     }
 }
 impl SyncSocketDescriptor {
-    fn new(connection_id: u64, resume_read_tx: Sender<()>, write_data_tx: Sender<Vec<u8>>) -> Self {
+    fn new(
+        connection_id: u64,
+        tcp_disconnector: TcpDisconnectooor,
+        resume_read_tx: Sender<()>,
+        write_data_tx: Sender<Vec<u8>>,
+    ) -> Self {
         Self {
             id: connection_id,
+            tcp_disconnector,
             resume_read_tx,
             write_data_tx,
         }
@@ -168,8 +176,6 @@ impl SocketDescriptor for SyncSocketDescriptor {
             let _ = self.resume_read_tx.try_send(());
         }
 
-        // TODO Unpause reading when resume_read == true
-
         // TODO: try_send() on write_data_tx
 
         // The data must be copied here since a &[u8] reference cannot be sent
@@ -182,8 +188,33 @@ impl SocketDescriptor for SyncSocketDescriptor {
         unimplemented!();
     }
 
+    /// There are several ways that a disconnect might be triggered:
+    /// 1) The Reader receives Ok(0) or Err from TcpStream::read(), i.e. the
+    ///    peer disconnected.
+    /// 2) The Reader receives Err from PeerManager::read_event(), i.e.
+    ///    Rust-Lightning told us to disconnect from the peer.
+    /// 3) The Writer receives Ok(0) from TcpStream::write() (undocumented
+    ///    behavior), or an ErrorKind that shouldn't be retried.
+    /// 4) This function (`SocketDescriptor::disconnect_socket`) is called.
+    ///
+    /// In all four cases, `TcpStream::shutdown(Shutdown::Both)` will end up
+    /// being called, letting any Readers or Writers currently blocked on
+    /// `read()` or `write()` receive `Ok(0)` or `Err`, respectively.
+    ///
+    /// There are two edge cases:
+    ///
+    /// - The first edge case is if Reader has read_paused set to true, in which
+    ///   case it will be blocked on the resume_read channel.
+    /// - The second edge case if if Writer doesn't have any data to write in
+    ///   its internal `buf`, in which case it is blocked on the write_data
+    ///   channel.
+    ///
+    /// In both cases, only once all `SyncSocketDescriptors` are dropped,
+    /// thereby dropping all of the `resume_read_tx`s and `write_data_tx`s ,
+    /// will the Reader and Writer detect a disconnected channel and proceed to
+    /// shut down.
     fn disconnect_socket(&mut self) {
-        // NOTE: Could send directly to reader / writer of this Connection
+        let _ = self.tcp_disconnector.shutdown();
     }
 }
 
@@ -206,10 +237,11 @@ impl Connection {
     /// separate threads to prevent reads from blocking writes and vice versa.
     ///
     /// To achieve this, internally, the TcpStream is cloned and split into a
-    /// TcpReader and TcpWriter. The TcpReader and TcpWriter newtypes are used
-    /// to reinforce that they *should* only used for reading and writing
-    /// respectively, but this is not enforced by the compiler due to their
-    /// private tuple fields still being readable by the impls in this file.
+    /// TcpReader and TcpWriter. The TcpReader and
+    /// TcpWriter newtypes are used to reinforce that they *should* only
+    /// used for reading and writing respectively, but this is not enforced
+    /// by the compiler due to their private tuple fields still being
+    /// readable by the impls in this file.
     ///
     /// init() additionally returns a `write_data_tx` which can be used to pass
     /// data to the Writer to send over TCP.
@@ -218,7 +250,7 @@ impl Connection {
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         resume_read_tx: Sender<()>,
         resume_read_rx: Receiver<()>,
-    ) -> (Self, Sender<Vec<u8>>)
+    ) -> (Self, TcpDisconnectooor, Sender<Vec<u8>>)
     where
         CMH: ChannelMessageHandler + 'static + Send + Sync,
         RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -226,18 +258,24 @@ impl Connection {
         UMH: CustomMessageHandler + 'static + Send + Sync,
     {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
-        let cloned_stream = original_stream.try_clone().expect("Clone failed");
 
-        let (mut writer, write_data_tx) = Writer::new(TcpWriter(cloned_stream));
-        let socket_descriptor =
-            SyncSocketDescriptor::new(id, resume_read_tx, write_data_tx.clone());
+        let writer_stream = original_stream.try_clone().unwrap();
+        let disconnector_stream = writer_stream.try_clone().unwrap();
 
-        let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
-            TcpReader(original_stream),
-            resume_read_rx,
-            peer_manager,
-            socket_descriptor,
+        let tcp_reader = TcpReader(original_stream);
+        let tcp_writer = TcpWriter(writer_stream);
+        let tcp_disconnectooor = TcpDisconnectooor(disconnector_stream);
+
+        let (mut writer, write_data_tx) = Writer::new(tcp_writer);
+        let socket_descriptor = SyncSocketDescriptor::new(
+            id,
+            tcp_disconnectooor.clone(),
+            resume_read_tx,
+            write_data_tx.clone(),
         );
+
+        let mut reader: Reader<CMH, RMH, L, UMH> =
+            Reader::new(tcp_reader, resume_read_rx, peer_manager, socket_descriptor);
 
         // Spawn the reader and writer threads
         thread::spawn(move || reader.run());
@@ -248,7 +286,7 @@ impl Connection {
             read_paused: false,
         };
 
-        (me, write_data_tx)
+        (me, tcp_disconnectooor, write_data_tx)
     }
 
     fn disconnect(&self) {
@@ -317,8 +355,8 @@ where
             } else {
                 // Reading is not paused; block on the next read.
                 // If the SyncSocketDescriptor disconnects the underlying TcpStream,
-                // the Reader will read Ok(0) or Err, in which case we know to
-                // break the loop and shut down.
+                // the Reader will read Ok(0), in which case we know to break
+                // the loop and shut down.
                 match self.inner.read(&mut buf) {
                     Ok(0) | Err(_) => {
                         // Peer disconnected
@@ -337,8 +375,7 @@ where
                             }
                             Err(_) => {
                                 // Rust-Lightning told us to disconnect; do it
-                                // TODO
-                                unimplemented!();
+                                break;
                             }
                         }
 
@@ -349,7 +386,8 @@ where
             }
         }
 
-        unimplemented!();
+        // Shut down the underlying stream. It's fine if it was already closed.
+        let _ = self.inner.shutdown();
     }
 }
 
@@ -380,12 +418,11 @@ struct Writer {
     start: usize,
 }
 impl Writer {
-    /// Generates a Writer and associated `write_data_tx` from a
-    /// TcpWriter
+    /// Generates a Writer and associated `write_data_tx` from a TcpWriter
     fn new(stream: TcpWriter) -> (Self, Sender<Vec<u8>>) {
         // Only one Vec<u8> can be in the channel at a time. This way, senders
-        // can know that previous writes are still processing when tx.is_full()
-        // returns true.
+        // can know that previous writes are still processing when tx.try_send()
+        // returns an Err(TrySendError::Full).
         //
         // This channel between the Writer and the holders of the
         // Sender<Vec<u8>>s can be thought of as a second buffer, where the
@@ -405,9 +442,9 @@ impl Writer {
     // TODO: Write comment describing this function
     #[allow(clippy::single_match)]
     fn run(&mut self) {
-        loop {
-            // TODO: Handle WriterCommands
+        use std::io::ErrorKind::*;
 
+        loop {
             match &self.buf {
                 Some(buf) => {
                     // We have data in our internal buffer; attempt to write it
@@ -426,20 +463,32 @@ impl Writer {
                                 self.start = end;
                             } else if bytes_written == 0 {
                                 // We received Ok, but nothing was written.
-                                //
-                                // Either the peer closed their read half only (unlikely) or the
-                                // peer disconnected from us and we
-                                // heard about it through our failed
-                                // write (more likely). Break the loop so that we can send a
-                                // disconnect.
+                                // The behavior that produces this result is not
+                                // clearly defined in the docs, but it's
+                                // probably safe to assume that the correct
+                                // response is to break the loop and shut down
+                                // the TcpStream.
                                 break;
                             } else {
                                 panic!("Unhandled case in Writer::run()");
                             }
                         }
-                        Err(_) => {
-                            // Write attempt errored; try again without updating
-                            // the start index
+                        Err(e) => {
+                            // Write attempt errored
+                            match e.kind() {
+                                TimedOut | Interrupted => {
+                                    // Retry the write in the next loop
+                                    // iteration if we received any of the above
+                                    // errors. It would be nice to additionally
+                                    // match HostUnreachable | NetworkDown |
+                                    // ResourceBusy, but these require nightly
+                                    // Rust.
+                                }
+                                _ => {
+                                    // For all other errors, break and shut down
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -456,7 +505,7 @@ impl Writer {
                         Err(_) => {
                             // Channel is empty and disconnected
                             // => no more messages can be sent
-                            // => break the loop and shut down the write half of the TcpStream
+                            // => break the loop and shut down
                             break;
                         }
                     }
@@ -464,12 +513,13 @@ impl Writer {
             }
         }
 
-        // Wrapping up: shut down the TcpStream
+        // Shut down the underlying stream. It's fine if it was already closed.
         let _ = self.inner.shutdown();
     }
 }
 
-/// A newtype for a TcpStream that can (and should) only be used for reading
+/// A newtype for a TcpStream that can (and should) only be used for (1) reading
+/// and (2) shutting down both halves of the TcpStream. Managed by the `Reader`.
 struct TcpReader(TcpStream);
 impl Read for TcpReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -477,14 +527,18 @@ impl Read for TcpReader {
     }
 }
 impl TcpReader {
-    /// Shuts down the read half of the underlying TcpStream.
-    /// The write half needs to be shut down separately.
+    /// Shuts down both the read and write halves of the underlying TcpStream.
+    ///
+    /// This allows the Reader to notify the Writer to shutdown, since the
+    /// Writer will receive an Err from their write() call when the write
+    /// half is closed.
     fn shutdown(&self) -> std::io::Result<()> {
-        self.0.shutdown(Shutdown::Read)
+        self.0.shutdown(Shutdown::Both)
     }
 }
 
-/// A newtype for a TcpStream that can (and should) only be used for writing
+/// A newtype for a TcpStream that can (and should) only be used for (1) writing
+/// and (2) shutting down both halves of the TcpStream. Managed by the `Writer`.
 struct TcpWriter(TcpStream);
 impl Write for TcpWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -495,10 +549,50 @@ impl Write for TcpWriter {
     }
 }
 impl TcpWriter {
-    /// Shuts down the write half of the underlying TcpStream.
-    /// The read half needs to be shut down separately.
+    /// Shuts down both the read and write halves of the underlying TcpStream.
+    ///
+    /// This allows the Writer to notify the Reader to shutdown, since the
+    /// Reader will receive an Ok(0) from their read() call when the read
+    /// half is closed.
     fn shutdown(&self) -> std::io::Result<()> {
-        self.0.shutdown(Shutdown::Write)
+        self.0.shutdown(Shutdown::Both)
+    }
+}
+
+/// A newtype for a TcpStream that can (and should) only be used for shutting
+/// down both halves of the TcpStream. Managed by the `SyncSocketDescriptor`.
+struct TcpDisconnectooor(TcpStream);
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+// @@@@@@@@@@@@@@%%%%%%%%%%@@@@@@@@@@@@
+// @@@@@@@@@@%###%@@@@@@@@%%##%@@@@@@@@
+// @@@@@@@@#*%@@@@@%%%%%@@@@@@%##%@@@@@
+// @@@@@@@##@@@@@@@@@@%%%@@@@@@@@#*@@@@
+// @@@@@@%*@@@@@@@@@@@@@%%%%@%%@@@@*@@@
+// @@@@@@*@@@@@@@@@%%%%%%@@@@@@@%%@**@@
+// @@@@@@*@@@@@@@%#@@@@@%@%@@@@%%@@%*%@
+// @@@@@%#@%%%%%@@@%##%%%##%@@%@@@@@#*@
+// @@@@@%#*=%%##*#*-*+-:+#*=**#+==-*#:%
+// @@@@@@*%%@@@@@@@=%#+=+%@-@@@:#-:@@:+
+// @@@@@@@*@@%@#%@@#*#####*#@@#+##***=*
+// @@@@@@@%*@%#:*@@@@@@@@@@@@@%##@@@#=#
+// @@@@@@@@@*@@+=@@@@@@@@*#@%@@##@@@*=@
+// @@@@@@@@@*@@%-=@@@@%#@%***#**%@@++@@
+// @@@@@@@@@+@@@*-=@@@#%* ....: =%*=@@@
+// @@@@@@@@##@@@%@=:#@@@*      .%*:%@@@
+// @@@@@@@%+@@@@@@@*==#@@#. .:+#-=@@@@@
+// @@@@@@#*@@@##%@@@@*=-+#*++**-*@@@@@@
+// @%#####@@@#%@@@@@@@@%#+###**%%%%%#%%
+// %%@@@@@@@@@@@@@@@%%%@%@@@@@@@@@@@@@@
+// @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+impl Clone for TcpDisconnectooor {
+    fn clone(&self) -> Self {
+        Self(self.0.try_clone().unwrap())
+    }
+}
+impl TcpDisconnectooor {
+    /// Shuts down both the read and write halves of the underlying TcpStream.
+    fn shutdown(&self) -> std::io::Result<()> {
+        self.0.shutdown(Shutdown::Both)
     }
 }
 
