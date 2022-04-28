@@ -27,6 +27,8 @@
 //! - (`write_data_tx`, `write_data_rx`): A channel of `Vec<u8>`s with size 1
 //!   from a [`SyncSocketDescriptor`] (multiple) to a [`Writer`] (singular) used
 //!   for sending data to the [`Writer`] to send to the peer.
+//! - TODO reader_cmd channel
+//! - TODO writer_cmd channel
 //! - TODO complete
 //!
 //! # Example Usage
@@ -70,11 +72,27 @@ where
     L: Logger + 'static + ?Sized + Send + Sync,
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
+    // Initialize all the channels. It has to be done here because otherwise there
+    // is a circular dependency between the Connection and SyncSocketDescriptors
+
+    // No reason to bound these channels which represent a queue of commands
+    // to execute
+    let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::unbounded();
+    let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
+
     let ip_addr = stream.peer_addr().unwrap();
-    let (conn, write_data_tx) = Connection::init(stream, peer_manager.clone());
+    let (conn, write_data_tx) = Connection::init(
+        stream,
+        peer_manager.clone(),
+        reader_cmd_tx.clone(),
+        reader_cmd_rx,
+        writer_cmd_tx.clone(),
+        writer_cmd_rx,
+    );
     let am_conn = Arc::new(Mutex::new(conn));
     let conn_id = { am_conn.lock().unwrap().id };
-    let mut socket_descriptor = SyncSocketDescriptor::from_connection_id(conn_id, &write_data_tx);
+    let mut socket_descriptor =
+        SyncSocketDescriptor::new(conn_id, reader_cmd_tx, writer_cmd_tx, write_data_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -97,10 +115,15 @@ where
         })
 }
 
+// TODO implement a From trait for IpAddr -> NetAddress
+
 /// An synchronous SocketDescriptor (i.e. it doesn't rely on Tokio)
+/// TODO spruce up the description a little bit
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
+    reader_cmd_tx: Sender<ReaderCommand>,
+    writer_cmd_tx: Sender<WriterCommand>,
     write_data_tx: Sender<Vec<u8>>,
 }
 impl PartialEq for SyncSocketDescriptor {
@@ -115,11 +138,16 @@ impl hash::Hash for SyncSocketDescriptor {
     }
 }
 impl SyncSocketDescriptor {
-    fn from_connection_id(connection_id: u64, write_data_tx: &Sender<Vec<u8>>) -> Self {
-        let write_data_tx = write_data_tx.clone();
-
+    fn new(
+        connection_id: u64,
+        reader_cmd_tx: Sender<ReaderCommand>,
+        writer_cmd_tx: Sender<WriterCommand>,
+        write_data_tx: Sender<Vec<u8>>,
+    ) -> Self {
         Self {
             id: connection_id,
+            reader_cmd_tx,
+            writer_cmd_tx,
             write_data_tx,
         }
     }
@@ -176,11 +204,13 @@ impl Connection {
     ///
     /// init() additionally returns a `write_data_tx` which can be used to pass
     /// data to the Writer to send over TCP.
-    /// TODO: Add another Arc<PeerManager> here which can be passed into the
-    /// reader and writer threads
     fn init<CMH, RMH, L, UMH>(
         original_stream: TcpStream,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+        reader_cmd_tx: Sender<ReaderCommand>,
+        reader_cmd_rx: Receiver<ReaderCommand>,
+        writer_cmd_tx: Sender<WriterCommand>,
+        writer_cmd_rx: Receiver<WriterCommand>,
     ) -> (Self, Sender<Vec<u8>>)
     where
         CMH: ChannelMessageHandler + 'static + Send + Sync,
@@ -191,11 +221,16 @@ impl Connection {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
         let cloned_stream = original_stream.try_clone().expect("Clone failed");
 
-        let (mut writer, write_data_tx) = Writer::from_tcp_writer(TcpWriter(cloned_stream));
-        let socket_descriptor = SyncSocketDescriptor::from_connection_id(id, &write_data_tx);
+        let (mut writer, write_data_tx) = Writer::new(TcpWriter(cloned_stream), writer_cmd_rx);
+        let socket_descriptor =
+            SyncSocketDescriptor::new(id, reader_cmd_tx, writer_cmd_tx, write_data_tx.clone());
 
-        let mut reader: Reader<CMH, RMH, L, UMH> =
-            Reader::from_tcp_reader(TcpReader(original_stream), peer_manager, socket_descriptor);
+        let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
+            TcpReader(original_stream),
+            reader_cmd_rx,
+            peer_manager,
+            socket_descriptor,
+        );
 
         // Spawn the reader and writer threads
         thread::spawn(move || reader.run());
@@ -214,6 +249,13 @@ impl Connection {
     }
 }
 
+/// Commands that can be sent to the Reader.
+enum ReaderCommand {
+    PauseRead,
+    Disconnect,
+}
+
+// TODO Write doc description
 struct Reader<CMH, RMH, L, UMH>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
@@ -224,6 +266,7 @@ where
     inner: TcpReader,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     descriptor: SyncSocketDescriptor,
+    reader_cmd_rx: Receiver<ReaderCommand>,
     read_paused: bool,
 }
 impl<CMH, RMH, L, UMH> Reader<CMH, RMH, L, UMH>
@@ -233,14 +276,16 @@ where
     L: Logger + 'static + ?Sized + Send + Sync,
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
-    fn from_tcp_reader(
+    fn new(
         reader: TcpReader,
+        reader_cmd_rx: Receiver<ReaderCommand>,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         descriptor: SyncSocketDescriptor,
     ) -> Self {
         Self {
             inner: reader,
             peer_manager,
+            reader_cmd_rx,
             descriptor,
             read_paused: false,
         }
@@ -253,6 +298,8 @@ where
         let mut buf = [0; 8192];
 
         loop {
+            // TODO handle ReaderCommands
+
             match self.inner.read(&mut buf) {
                 Ok(0) | Err(_) => {
                     // Peer disconnected
@@ -281,8 +328,15 @@ where
     }
 }
 
+/// Commands that can be sent to the Writer.
+enum WriterCommand {
+    Disconnect,
+}
+
+// TODO Write doc description
 struct Writer {
     inner: TcpWriter,
+    writer_cmd_rx: Receiver<WriterCommand>,
     write_data_rx: Receiver<Vec<u8>>,
     /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
@@ -309,7 +363,7 @@ struct Writer {
 impl Writer {
     /// Generates a Writer and associated `write_data_tx` from a
     /// TcpWriter
-    fn from_tcp_writer(writer: TcpWriter) -> (Self, Sender<Vec<u8>>) {
+    fn new(stream: TcpWriter, writer_cmd_rx: Receiver<WriterCommand>) -> (Self, Sender<Vec<u8>>) {
         // Only one Vec<u8> can be in the channel at a time. This way, senders
         // can know that previous writes are still processing when tx.is_full()
         // returns true.
@@ -320,7 +374,8 @@ impl Writer {
         // the third buffer is the &[u8] passed into send_data().
         let (write_data_tx, write_data_rx) = crossbeam::channel::bounded(1);
         let me = Self {
-            inner: writer,
+            inner: stream,
+            writer_cmd_rx,
             write_data_rx,
             buf: None,
             start: 0,
@@ -333,6 +388,8 @@ impl Writer {
     #[allow(clippy::single_match)]
     fn run(&mut self) {
         loop {
+            // TODO: Handle WriterCommands
+
             match &self.buf {
                 Some(buf) => {
                     // We have data in our internal buffer; attempt to write it
