@@ -118,7 +118,8 @@ where
 // TODO implement a From trait for IpAddr -> NetAddress
 
 /// An synchronous SocketDescriptor (i.e. it doesn't rely on Tokio)
-/// TODO spruce up the description a little bit
+/// TODO Describe what this SocketDescriptor *is* as well as what it *does*; to
+/// a newcomer it's probably not immediately clear
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
@@ -153,12 +154,33 @@ impl SyncSocketDescriptor {
     }
 }
 impl SocketDescriptor for SyncSocketDescriptor {
-    fn send_data(&mut self, data: &[u8], _resume_read: bool) -> usize {
+    /// TODO Write in a high level description of what this function (and more
+    /// generally the SocketDescriptor) *does*
+    ///
+    /// This implementation never calls back into the PeerManager directly,
+    /// thereby preventing reentrancy / deadlock issues. Instead, any commands
+    /// to be processed and data to be sent are dispatched to the Reader or
+    /// Writer via crossbeam channels.
+    ///
+    /// Additionally, sending across the crossbeam channels is done exclusively
+    /// with non-blocking try_send()s rather than blocking send()s, to ensure
+    /// that this function always returns immediately, thereby also reducing the
+    /// amount of time that the PeerManager's internal locks are held.
+    fn send_data(&mut self, data: &[u8], resume_read: bool) -> usize {
         if data.is_empty() {
             return 0;
         }
 
-        // Get a reader_cmd_tx in here
+        if resume_read {
+            // It doesn't really matter whether the send is Ok or Err:
+            // - If Ok, the send went through, nothing else to do
+            // - Since this channel is unbounded, an Err can only mean that the channel is
+            //   disconnected. This might happen in the case that the Reader detected a
+            //   disconnected peer and already shut itself down by the time this command was
+            //   sent; no need to panic.
+            let _ = self.reader_cmd_tx.try_send(ReaderCommand::ResumeRead);
+        }
+
         // TODO Unpause reading when resume_read == true
 
         // TODO: try_send() on write_data_tx
@@ -251,7 +273,7 @@ impl Connection {
 
 /// Commands that can be sent to the Reader.
 enum ReaderCommand {
-    PauseRead,
+    ResumeRead,
     Disconnect,
 }
 
@@ -298,7 +320,8 @@ where
         let mut buf = [0; 8192];
 
         loop {
-            // TODO handle ReaderCommands
+            // TODO handle ResumeRead command
+            // TODO handle Disconnect command
 
             match self.inner.read(&mut buf) {
                 Ok(0) | Err(_) => {
