@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam::channel::{Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender, TrySendError};
 
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
 use lightning::ln::peer_handler::{
@@ -176,17 +176,30 @@ impl SocketDescriptor for SyncSocketDescriptor {
             let _ = self.resume_read_tx.try_send(());
         }
 
-        // TODO: try_send() on write_data_tx
-
-        // The data must be copied here since a &[u8] reference cannot be sent
-        // across threads, and a synchronous runtime requires dedicated threads
-        // for reading and writing.
-        // This copying
-        // introduces a small amount of overhead. For a
-        // zero-copy implementation, use `lightning-net-tokio`.
-
-        unimplemented!();
+        // The data must be copied here since a &[u8] reference cannot be safely
+        // sent across threads. This incurs a small amount of overhead.
+        let owned_data = data.to_vec();
+        match self.write_data_tx.try_send(owned_data) {
+            Ok(()) => {
+                // Data was successfully sent to the Writer.
+                data.len()
+            }
+            Err(e) => match e {
+                TrySendError::Full(_) => {
+                    // Busy writing, time to pause read
+                    // TODO tell Reader to pause read
+                    0
+                }
+                TrySendError::Disconnected(_) => {
+                    // This might happen if the Writer detected a disconnect and
+                    // shut down on its own. Return 0.
+                    0
+                }
+            },
+        }
     }
+
+    // TODO shouldn't the PeerManager be notified if the _ is _?
 
     /// There are several ways that a disconnect might be triggered:
     /// 1) The Reader receives Ok(0) or Err from TcpStream::read(), i.e. the
@@ -277,7 +290,8 @@ impl Connection {
         let mut reader: Reader<CMH, RMH, L, UMH> =
             Reader::new(tcp_reader, resume_read_rx, peer_manager, socket_descriptor);
 
-        // Spawn the reader and writer threads
+        // Spawn the reader and writer threads. Using a synchronous runtime
+        // requires that there are dedicated threads for reading and writing.
         thread::spawn(move || reader.run());
         thread::spawn(move || writer.run());
 
@@ -501,6 +515,8 @@ impl Writer {
                                 self.buf = Some(data);
                                 self.start = 0;
                             }
+
+                            // TODO call write_buffer_space_avail
                         }
                         Err(_) => {
                             // Channel is empty and disconnected
