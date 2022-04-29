@@ -269,8 +269,8 @@ impl SocketDescriptor for SyncSocketDescriptor {
     }
 
     /// There are several ways that a disconnect might be triggered:
-    /// 1) The Reader receives Ok(0) or Err from TcpStream::read(), i.e. the
-    ///    peer disconnected.
+    /// 1) The Reader receives Ok(0) from TcpStream::read() (i.e. the
+    ///    peer disconnected), or an Err that shouldn't be retried.
     /// 2) The Reader receives Err from PeerManager::read_event(); i.e.
     ///    Rust-Lightning told us to disconnect from the peer.
     /// 3) The Writer receives Ok(0) from TcpStream::write() (undocumented
@@ -371,6 +371,8 @@ where
 
     // TODO write function description
     fn run(&mut self) {
+        use std::io::ErrorKind::*;
+
         // 8KB is nice and big but also should never cause any issues with stack
         // overflowing.
         let mut buf = [0; 8192];
@@ -397,7 +399,7 @@ where
                 // the Reader will read Ok(0), in which case we know to break
                 // the loop and shut down.
                 match self.inner.read(&mut buf) {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
                         // Peer disconnected. Notify the PeerManager then break
                         self.peer_manager.socket_disconnected(&self.descriptor);
                         self.peer_manager.process_events();
@@ -424,6 +426,18 @@ where
                         // As noted in the read_event() docs, call process_events().
                         self.peer_manager.process_events()
                     }
+                    Err(e) => match e.kind() {
+                        TimedOut | Interrupted => {
+                            // Retry
+                        }
+                        _ => {
+                            // For all other errors, notify the
+                            // PeerManager, break, and shut down
+                            self.peer_manager.socket_disconnected(&self.descriptor);
+                            self.peer_manager.process_events();
+                            break;
+                        }
+                    },
                 }
             }
         }
@@ -578,26 +592,23 @@ where
                                 panic!("More bytes were written than were given");
                             }
                         }
-                        Err(e) => {
-                            // Write attempt errored
-                            match e.kind() {
-                                TimedOut | Interrupted => {
-                                    // Retry the write in the next loop
-                                    // iteration if we received any of the above
-                                    // errors. It would be nice to additionally
-                                    // match HostUnreachable | NetworkDown |
-                                    // ResourceBusy, but these require nightly
-                                    // Rust.
-                                }
-                                _ => {
-                                    // For all other errors, notify the
-                                    // PeerManager, break, and shut down
-                                    self.peer_manager.socket_disconnected(&self.descriptor);
-                                    self.peer_manager.process_events();
-                                    break;
-                                }
+                        Err(e) => match e.kind() {
+                            TimedOut | Interrupted => {
+                                // Retry the write in the next loop
+                                // iteration if we received any of the above
+                                // errors. It would be nice to additionally
+                                // match HostUnreachable | NetworkDown |
+                                // ResourceBusy, but these require nightly
+                                // Rust.
                             }
-                        }
+                            _ => {
+                                // For all other errors, notify the
+                                // PeerManager, break, and shut down
+                                self.peer_manager.socket_disconnected(&self.descriptor);
+                                self.peer_manager.process_events();
+                                break;
+                            }
+                        },
                     }
                 }
                 None => {
