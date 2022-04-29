@@ -18,6 +18,9 @@
 //! See the [EDP docs](https://edp.fortanix.com/docs/concepts/rust-std/) for
 //! more information on what Rust features can and cannot be used within SGX.
 //!
+//! TODO Make note of especially the limitations in timeouts and stream
+//! networking
+//!
 //! Those who wish to maximize performance should use `lightning-net-tokio`.
 //! Those who want to run rust-lightning with a synchronous runtime, smaller
 //! code size, or no dependency or Tokio, should use this crate.
@@ -48,23 +51,64 @@ use std::thread;
 
 use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError};
 
+use bitcoin::secp256k1::key::PublicKey;
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
 use lightning::ln::peer_handler::{
     CustomMessageHandler, PeerHandleError, PeerManager, SocketDescriptor,
 };
 use lightning::util::logger::Logger;
 
+/// Initiates an outbound connection to a peer given their node ID (public key)
+/// and socket address.
+///
+/// This fn is shorthand for TcpStream::connect(addr) followed by
+/// handle_connection(). Note that unlike handle_connection() which completes
+/// instantly, initiate_outbound() will block on the TcpStream::connect() call.
+///
+/// If TcpStream::connect() succeeds, this function returns Ok() containing
+/// the return value of handle_connection(). Otherwise, an Err containing the
+/// std::io::Error is returned.
+pub fn initiate_outbound<CMH, RMH, L, UMH>(
+    peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    their_node_id: PublicKey,
+    addr: SocketAddr,
+) -> Result<Result<(), PeerHandleError>, std::io::Error>
+where
+    CMH: ChannelMessageHandler + 'static + Send + Sync,
+    RMH: RoutingMessageHandler + 'static + Send + Sync,
+    L: Logger + 'static + ?Sized + Send + Sync,
+    UMH: CustomMessageHandler + 'static + Send + Sync,
+{
+    TcpStream::connect(&addr).map(|stream| {
+        handle_connection(
+            peer_manager,
+            stream,
+            ConnectionType::Outbound(their_node_id),
+        )
+    })
+}
+
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Spawns the threads necessary to manage a freshly accepted incoming
-/// connection.
+/// Whether the new connection was initiated by the peer (inbound) or initiated
+/// by us (outbound). If the new connection was outbound, the PublicKey
+/// representing the node ID of the peer must be specified.
+pub enum ConnectionType {
+    Inbound,
+    Outbound(PublicKey),
+}
+
+/// Spawns the threads necessary to manage a new connection handling both
+/// inbound and outbound connections. This function only needs to be called once
+/// for every connection, and since the work is done on dedicated threads that
+/// will exit by themselves when required, nothing further needs to be done to
+/// manage the connection.
 ///
-/// This function only needs to be called once for every incoming connection.
-///
-/// Returns the result of calling PeerManager::new_inbound_connection(),
-pub fn setup_inbound<CMH, RMH, L, UMH>(
+/// Returns a Result indicating whether the PeerManager accepted the connection.
+pub fn handle_connection<CMH, RMH, L, UMH>(
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     stream: TcpStream,
+    conn_type: ConnectionType,
 ) -> Result<(), PeerHandleError>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
@@ -87,7 +131,7 @@ where
     let tcp_disconnector = TcpDisconnectooor(disconnector_stream);
 
     // Init SyncSocketDescriptor
-    let mut socket_descriptor = SyncSocketDescriptor::new(
+    let mut descriptor = SyncSocketDescriptor::new(
         conn_id,
         tcp_disconnector,
         reader_cmd_tx.clone(),
@@ -98,14 +142,14 @@ where
     let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
         tcp_reader,
         peer_manager.clone(),
-        socket_descriptor.clone(),
+        descriptor.clone(),
         reader_cmd_rx,
         writer_cmd_tx,
     );
     let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
         tcp_writer,
         peer_manager.clone(),
-        socket_descriptor.clone(),
+        descriptor.clone(),
         reader_cmd_tx,
         writer_cmd_rx,
     );
@@ -115,14 +159,35 @@ where
     thread::spawn(move || reader.run());
     thread::spawn(move || writer.run());
 
-    // Notify the PeerManager of the new inbound connection.
-    peer_manager
-        .new_inbound_connection(socket_descriptor.clone(), Some(to_net(socket_addr)))
-        .map_err(|e| {
-            // PeerManager rejected this connection; disconnect
-            socket_descriptor.disconnect_socket();
-            e
-        })
+    // Notify the PeerManager of the new connection.
+    // If Ok, send the initial data if it was an outbound connection.
+    // If Err, disconnect the TcpStream and shutdown the Reader and Writer.
+    match conn_type {
+        ConnectionType::Inbound => {
+            peer_manager.new_inbound_connection(descriptor.clone(), Some(to_net(socket_addr)))
+        }
+        ConnectionType::Outbound(their_node_id) => peer_manager
+            .new_outbound_connection(their_node_id, descriptor.clone(), Some(to_net(socket_addr)))
+            .map(|initial_data| {
+                // PeerManager accepted the connection; send the initial data
+                // This should always succeed since send_data just pushes data
+                // into the writer_cmd channel and the writer_cmd channel always
+                // starts out completely empty. If pushing the initial 10s of
+                // bytes into the writer_cmd channel fails, something is very
+                // wrong; probably a programmer error.
+                let bytes_pushed = descriptor.send_data(&initial_data, true);
+                if bytes_pushed != initial_data.len() {
+                    panic!("The initial write should always succeed");
+                }
+            }),
+    }
+    .map_err(|e| {
+        // PeerManager rejected this connection; disconnect
+        // In line with the requirements of new_inbound_connection() and
+        // new_outbound_connection(), we do NOT call socket_disconnected() here.
+        descriptor.disconnect_socket();
+        e
+    })
 }
 
 // NOTE: It would be nice to have a `impl From<SocketAddr> for NetAddress` in
@@ -173,11 +238,11 @@ fn init_channels() -> (
     (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx)
 }
 
-// TODO refactor setup_inbound into setup with an enum for inbound / outbound
-
 /// An synchronous SocketDescriptor (i.e. it doesn't rely on Tokio)
 /// TODO Describe what this SocketDescriptor *is* as well as what it *does*; to
 /// a newcomer it's probably not immediately clear
+///
+/// Public only because it is the concrete type required by handle_connection()
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
