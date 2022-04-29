@@ -225,13 +225,13 @@ impl SocketDescriptor for SyncSocketDescriptor {
     /// that this function always returns immediately, thereby also reducing the
     /// amount of time that the PeerManager's internal locks are held.
     fn send_data(&mut self, data: &[u8], resume_read: bool) -> usize {
-        if data.is_empty() {
-            return 0;
-        }
-
         if resume_read {
             // It doesn't matter whether the send is Ok or Err
             let _ = self.reader_cmd_tx.try_send(ReaderCommand::ResumeRead);
+        }
+
+        if data.is_empty() {
+            return 0;
         }
 
         // To ensure that there is always space for a Shutdown command, only
@@ -512,7 +512,7 @@ where
     /// allocation or data move.
     ///
     /// Writer code must maintain the invariant that `start < buf.len()`.
-    /// If `start == buf.len()`, the value of `buf` should be `None`.
+    /// If `start == buf.len()`, `buf` should be `None` and `start` should be 0.
     start: usize,
 }
 impl<CMH, RMH, L, UMH> Writer<CMH, RMH, L, UMH>
