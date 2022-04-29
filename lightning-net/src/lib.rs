@@ -98,13 +98,14 @@ where
     let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
         tcp_reader,
         peer_manager.clone(),
+        socket_descriptor.clone(),
         reader_cmd_rx,
         writer_cmd_tx,
-        socket_descriptor.clone(),
     );
     let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
         tcp_writer,
         peer_manager.clone(),
+        socket_descriptor.clone(),
         reader_cmd_tx,
         writer_cmd_rx,
     );
@@ -351,16 +352,16 @@ where
     fn new(
         reader: TcpReader,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+        descriptor: SyncSocketDescriptor,
         reader_cmd_rx: Receiver<ReaderCommand>,
         writer_cmd_tx: Sender<WriterCommand>,
-        descriptor: SyncSocketDescriptor,
     ) -> Self {
         Self {
             inner: reader,
             peer_manager,
+            descriptor,
             reader_cmd_rx,
             writer_cmd_tx,
-            descriptor,
             read_paused: false,
         }
     }
@@ -484,6 +485,7 @@ where
 {
     inner: TcpWriter,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    descriptor: SyncSocketDescriptor,
     reader_cmd_tx: Sender<ReaderCommand>,
     writer_cmd_rx: Receiver<WriterCommand>,
     /// An internal buffer which stores the data that the Writer is
@@ -499,13 +501,12 @@ where
     /// number of bytes written, while full writes reset `buf` back to None and
     /// the start index back to 0.
     ///
-    /// Using this start index avoids the need to call buf.split_off() or
-    /// .drain() which respectively incur the cost of an additional Vec
+    /// Using this start index avoids the need to call Vec::split_off() or
+    /// drain() which respectively incur the cost of an additional Vec
     /// allocation or data move.
     ///
-    /// Writer code must maintain the invariant that
-    /// `start < buf.len()`. If `start == buf.len()`, the value of `buf` should
-    /// be `None`.
+    /// Writer code must maintain the invariant that `start < buf.len()`.
+    /// If `start == buf.len()`, the value of `buf` should be `None`.
     start: usize,
 }
 impl<CMH, RMH, L, UMH> Writer<CMH, RMH, L, UMH>
@@ -515,16 +516,17 @@ where
     L: Logger + 'static + ?Sized + Send + Sync,
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
-    /// Generates a Writer and associated `writer_cmd_tx` from a TcpWriter
     fn new(
         writer: TcpWriter,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+        descriptor: SyncSocketDescriptor,
         reader_cmd_tx: Sender<ReaderCommand>,
         writer_cmd_rx: Receiver<WriterCommand>,
     ) -> Self {
         Self {
             inner: writer,
             peer_manager,
+            descriptor,
             reader_cmd_tx,
             writer_cmd_rx,
             buf: None,
