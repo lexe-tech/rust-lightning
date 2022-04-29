@@ -41,7 +41,7 @@
 
 use core::hash;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -53,6 +53,8 @@ use lightning::ln::peer_handler::{
     CustomMessageHandler, PeerHandleError, PeerManager, SocketDescriptor,
 };
 use lightning::util::logger::Logger;
+
+static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Spawns the threads necessary to manage a freshly accepted incoming
 /// connection.
@@ -70,8 +72,76 @@ where
     L: Logger + 'static + ?Sized + Send + Sync,
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
-    // Initialize all the channels.
+    // Init channels
+    let (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx) = init_channels();
 
+    // Generate a new ID that represents this connection
+    let conn_id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
+    let socket_addr = stream.peer_addr().unwrap();
+
+    // Init SyncSocketDescriptor
+    let mut socket_descriptor =
+        SyncSocketDescriptor::new(conn_id, reader_cmd_tx.clone(), writer_cmd_tx.clone());
+
+    // Init TcpReader, TcpWriter, TcpDisconnectooor
+    let writer_stream = stream.try_clone().unwrap();
+    // let disconnector_stream = stream.try_clone().unwrap();
+    let tcp_reader = TcpReader(stream);
+    let tcp_writer = TcpWriter(writer_stream);
+    // let tcp_disconnector = TcpDisconnectooor(disconnector_stream);
+
+    // Init Reader and Writer
+    let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
+        tcp_reader,
+        peer_manager.clone(),
+        reader_cmd_rx,
+        writer_cmd_tx,
+        socket_descriptor.clone(),
+    );
+    let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
+        tcp_writer,
+        peer_manager.clone(),
+        reader_cmd_tx,
+        writer_cmd_rx,
+    );
+
+    // Spawn the reader and writer threads. Using a synchronous runtime
+    // requires that there are dedicated threads for reading and writing.
+    thread::spawn(move || reader.run());
+    thread::spawn(move || writer.run());
+
+    // Notify the PeerManager of the new inbound connection.
+    peer_manager
+        .new_inbound_connection(socket_descriptor.clone(), Some(to_net(socket_addr)))
+        .map_err(|e| {
+            // PeerManager rejected this connection; disconnect
+            socket_descriptor.disconnect_socket();
+            e
+        })
+}
+
+// NOTE: It would be nice to have a `impl From<SocketAddr> for NetAddress` in
+//       the `lightning` crate
+fn to_net(socket_addr: SocketAddr) -> NetAddress {
+    match socket_addr.ip() {
+        IpAddr::V4(ip) => NetAddress::IPv4 {
+            addr: ip.octets(),
+            port: socket_addr.port(),
+        },
+        IpAddr::V6(ip) => NetAddress::IPv6 {
+            addr: ip.octets(),
+            port: socket_addr.port(),
+        },
+    }
+}
+
+/// Initializes all the crossbeam channels.
+fn init_channels() -> (
+    Sender<ReaderCommand>,
+    Receiver<ReaderCommand>,
+    Sender<WriterCommand>,
+    Receiver<WriterCommand>,
+) {
     // No reason to bound this channel
     let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
 
@@ -95,39 +165,7 @@ where
     // &[u8] passed into send_data().
     let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::bounded(2);
 
-    let ip_addr = stream.peer_addr().unwrap();
-
-    let conn_id = Connection::init(
-        stream,
-        peer_manager.clone(),
-        reader_cmd_tx.clone(),
-        reader_cmd_rx,
-        writer_cmd_tx.clone(),
-        writer_cmd_rx,
-    );
-
-    // TODO get the connection id as a return value of Connection::init()
-    let mut socket_descriptor = SyncSocketDescriptor::new(conn_id, reader_cmd_tx, writer_cmd_tx);
-
-    let net_address = match ip_addr.ip() {
-        IpAddr::V4(ip) => NetAddress::IPv4 {
-            addr: ip.octets(),
-            port: ip_addr.port(),
-        },
-        IpAddr::V6(ip) => NetAddress::IPv6 {
-            addr: ip.octets(),
-            port: ip_addr.port(),
-        },
-    };
-
-    // Notify the PeerManager of the new inbound connection.
-    peer_manager
-        .new_inbound_connection(socket_descriptor.clone(), Some(net_address))
-        .map_err(|e| {
-            // PeerManager rejected this connection; disconnect
-            socket_descriptor.disconnect_socket();
-            e
-        })
+    (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx)
 }
 
 // TODO refactor setup_inbound into setup with an enum for inbound / outbound
@@ -271,81 +309,6 @@ impl SocketDescriptor for SyncSocketDescriptor {
         let _ = self.reader_cmd_tx.try_send(ReaderCommand::Shutdown);
         let _ = self.writer_cmd_tx.try_send(WriterCommand::Shutdown);
         // TODO implement the TcpDisconnectooor
-    }
-}
-
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-// TODO Since all this struct holds is an id and all it does is init(), all of
-// its logic can be refactored away into setup()
-/// Represents a TCP connection to a peer.
-///
-/// There should only be one `Connection` struct per TCP connection
-/// (hence by init() takes ownership of the underlying TcpStream).
-struct Connection {
-    id: u64,
-}
-impl Connection {
-    /// Generates a new Connection given an existing TcpStream and spawns
-    /// processing threads for Reader and Writer.
-    ///
-    /// Reads and writes are blocking, so reading and writing is done on
-    /// separate threads to prevent reads from blocking writes and vice versa.
-    ///
-    /// To achieve this, internally, the TcpStream is cloned and split into a
-    /// TcpReader and TcpWriter. The TcpReader and
-    /// TcpWriter newtypes are used to reinforce that they *should* only
-    /// used for reading and writing respectively, but this is not enforced
-    /// by the compiler due to their private tuple fields still being
-    /// readable by the impls in this file.
-    ///
-    /// init() additionally returns a `writer_cmd_tx` which can be used to pass
-    /// data to the Writer to send over TCP.
-    fn init<CMH, RMH, L, UMH>(
-        original_stream: TcpStream,
-        peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
-        reader_cmd_tx: Sender<ReaderCommand>,
-        reader_cmd_rx: Receiver<ReaderCommand>,
-        writer_cmd_tx: Sender<WriterCommand>,
-        writer_cmd_rx: Receiver<WriterCommand>,
-    ) -> u64
-    where
-        CMH: ChannelMessageHandler + 'static + Send + Sync,
-        RMH: RoutingMessageHandler + 'static + Send + Sync,
-        L: Logger + 'static + ?Sized + Send + Sync,
-        UMH: CustomMessageHandler + 'static + Send + Sync,
-    {
-        // TODO
-        let conn_id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
-
-        let writer_stream = original_stream.try_clone().unwrap();
-
-        let tcp_reader = TcpReader(original_stream);
-        let tcp_writer = TcpWriter(writer_stream);
-
-        let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
-            tcp_writer,
-            peer_manager.clone(),
-            reader_cmd_tx.clone(),
-            writer_cmd_rx,
-        );
-        let socket_descriptor =
-            SyncSocketDescriptor::new(conn_id, reader_cmd_tx, writer_cmd_tx.clone());
-
-        let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
-            tcp_reader,
-            peer_manager,
-            reader_cmd_rx,
-            writer_cmd_tx,
-            socket_descriptor,
-        );
-
-        // Spawn the reader and writer threads. Using a synchronous runtime
-        // requires that there are dedicated threads for reading and writing.
-        thread::spawn(move || reader.run());
-        thread::spawn(move || writer.run());
-
-        conn_id
     }
 }
 
