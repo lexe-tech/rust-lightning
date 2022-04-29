@@ -27,7 +27,7 @@
 //! - (`write_data_tx`, `write_data_rx`): A channel of `Vec<u8>`s with size 1
 //!   from a [`SyncSocketDescriptor`] (multiple) to a [`Writer`] (singular) used
 //!   for sending data to the [`Writer`] to send to the peer.
-//! - TODO resume_read channel
+//! - TODO reader_cmd_tx, reader_cmd_rx channel
 //! - TODO complete
 //!
 //! # Example Usage
@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam::channel::{Receiver, Sender, TrySendError};
+use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
 use lightning::ln::peer_handler::{
@@ -75,19 +75,19 @@ where
     // is a circular dependency between the Connection and SyncSocketDescriptors
 
     // No reason to bound this channel
-    let (resume_read_tx, resume_read_rx) = crossbeam::channel::unbounded();
+    let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
 
     let ip_addr = stream.peer_addr().unwrap();
     let (conn, disconnectooor, write_data_tx) = Connection::init(
         stream,
         peer_manager.clone(),
-        resume_read_tx.clone(),
-        resume_read_rx,
+        reader_cmd_tx.clone(),
+        reader_cmd_rx,
     );
     let am_conn = Arc::new(Mutex::new(conn));
     let conn_id = { am_conn.lock().unwrap().id };
     let mut socket_descriptor =
-        SyncSocketDescriptor::new(conn_id, disconnectooor, resume_read_tx, write_data_tx);
+        SyncSocketDescriptor::new(conn_id, disconnectooor, reader_cmd_tx, write_data_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -119,7 +119,7 @@ where
 pub struct SyncSocketDescriptor {
     id: u64,
     tcp_disconnector: TcpDisconnectooor,
-    resume_read_tx: Sender<()>,
+    reader_cmd_tx: Sender<ReaderCommand>,
     write_data_tx: Sender<Vec<u8>>,
 }
 impl PartialEq for SyncSocketDescriptor {
@@ -137,13 +137,13 @@ impl SyncSocketDescriptor {
     fn new(
         connection_id: u64,
         tcp_disconnector: TcpDisconnectooor,
-        resume_read_tx: Sender<()>,
+        reader_cmd_tx: Sender<ReaderCommand>,
         write_data_tx: Sender<Vec<u8>>,
     ) -> Self {
         Self {
             id: connection_id,
             tcp_disconnector,
-            resume_read_tx,
+            reader_cmd_tx,
             write_data_tx,
         }
     }
@@ -167,13 +167,8 @@ impl SocketDescriptor for SyncSocketDescriptor {
         }
 
         if resume_read {
-            // It doesn't really matter whether the send is Ok or Err:
-            // - If Ok, the send went through, nothing else to do
-            // - Since this channel is unbounded, an Err can only mean that the channel is
-            //   disconnected. This might happen in the case that the Reader detected a
-            //   disconnected peer and already shut itself down by the time this command was
-            //   sent. There is no need to panic in this case
-            let _ = self.resume_read_tx.try_send(());
+            // It doesn't matter whether the send is Ok or Err
+            let _ = self.reader_cmd_tx.try_send(ReaderCommand::ResumeRead);
         }
 
         // The data must be copied here since a &[u8] reference cannot be safely
@@ -187,7 +182,8 @@ impl SocketDescriptor for SyncSocketDescriptor {
             Err(e) => match e {
                 TrySendError::Full(_) => {
                     // Busy writing, time to pause read
-                    // TODO tell Reader to pause read
+                    // Still doesn't matter whether the send is Ok or Err
+                    let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
                     0
                 }
                 TrySendError::Disconnected(_) => {
@@ -223,7 +219,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
     ///   channel.
     ///
     /// In both cases, only once all `SyncSocketDescriptors` are dropped,
-    /// thereby dropping all of the `resume_read_tx`s and `write_data_tx`s ,
+    /// thereby dropping all of the `reader_cmd_tx`s and `write_data_tx`s ,
     /// will the Reader and Writer detect a disconnected channel and proceed to
     /// shut down.
     fn disconnect_socket(&mut self) {
@@ -261,8 +257,8 @@ impl Connection {
     fn init<CMH, RMH, L, UMH>(
         original_stream: TcpStream,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
-        resume_read_tx: Sender<()>,
-        resume_read_rx: Receiver<()>,
+        reader_cmd_tx: Sender<ReaderCommand>,
+        reader_cmd_rx: Receiver<ReaderCommand>,
     ) -> (Self, TcpDisconnectooor, Sender<Vec<u8>>)
     where
         CMH: ChannelMessageHandler + 'static + Send + Sync,
@@ -283,12 +279,12 @@ impl Connection {
         let socket_descriptor = SyncSocketDescriptor::new(
             id,
             tcp_disconnectooor.clone(),
-            resume_read_tx,
+            reader_cmd_tx,
             write_data_tx.clone(),
         );
 
         let mut reader: Reader<CMH, RMH, L, UMH> =
-            Reader::new(tcp_reader, resume_read_rx, peer_manager, socket_descriptor);
+            Reader::new(tcp_reader, reader_cmd_rx, peer_manager, socket_descriptor);
 
         // Spawn the reader and writer threads. Using a synchronous runtime
         // requires that there are dedicated threads for reading and writing.
@@ -302,10 +298,12 @@ impl Connection {
 
         (me, tcp_disconnectooor, write_data_tx)
     }
+}
 
-    fn disconnect(&self) {
-        unimplemented!();
-    }
+/// Commands that can be sent to the Reader.
+enum ReaderCommand {
+    ResumeRead,
+    PauseRead,
 }
 
 // TODO Write doc description
@@ -319,7 +317,7 @@ where
     inner: TcpReader,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     descriptor: SyncSocketDescriptor,
-    resume_read_rx: Receiver<()>,
+    reader_cmd_rx: Receiver<ReaderCommand>,
     read_paused: bool,
 }
 impl<CMH, RMH, L, UMH> Reader<CMH, RMH, L, UMH>
@@ -331,14 +329,14 @@ where
 {
     fn new(
         reader: TcpReader,
-        resume_read_rx: Receiver<()>,
+        reader_cmd_rx: Receiver<ReaderCommand>,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         descriptor: SyncSocketDescriptor,
     ) -> Self {
         Self {
             inner: reader,
             peer_manager,
-            resume_read_rx,
+            reader_cmd_rx,
             descriptor,
             read_paused: false,
         }
@@ -351,20 +349,21 @@ where
         let mut buf = [0; 8192];
 
         loop {
+            // Every time this line is reached, read_paused == false.
+            // Do a non-blocking check to see if we've been asked to pause reads
+            let shutdown = self.handle_command(false);
+            if shutdown {
+                break;
+            }
+
             if self.read_paused {
                 // To avoid a busy loop while reading is paused, block on the
-                // resume_read channel until we are told to resume reading again
+                // reader_cmd channel until we are told to resume reading again
                 // or until all channel senders are dropped (in which case we
                 // will shut down).
-                match self.resume_read_rx.recv() {
-                    Ok(()) => {
-                        // Resume reading
-                        self.read_paused = false;
-                    }
-                    Err(_) => {
-                        // The channel is disconnected, break and shut down
-                        break;
-                    }
+                let shutdown = self.handle_command(true);
+                if shutdown {
+                    break;
                 }
             } else {
                 // Reading is not paused; block on the next read.
@@ -402,6 +401,44 @@ where
 
         // Shut down the underlying stream. It's fine if it was already closed.
         let _ = self.inner.shutdown();
+    }
+
+    /// Handles a potential ReaderCommand in a blocking or non-blocking manner.
+    /// Returns a bool representing whether the Reader should break the event
+    /// loop and shut down.
+    fn handle_command(&mut self, block: bool) -> bool {
+        if block {
+            match self.reader_cmd_rx.recv() {
+                Ok(cmd) => match cmd {
+                    ReaderCommand::PauseRead => {
+                        self.read_paused = true;
+                    }
+                    ReaderCommand::ResumeRead => {
+                        self.read_paused = false;
+                    }
+                },
+                Err(_) => {
+                    // The channel is disconnected, break and shut down
+                    return true;
+                }
+            }
+        } else {
+            match self.reader_cmd_rx.try_recv() {
+                Ok(cmd) => match cmd {
+                    ReaderCommand::PauseRead => {
+                        self.read_paused = true;
+                    }
+                    ReaderCommand::ResumeRead => {
+                        self.read_paused = false;
+                    }
+                },
+                Err(e) => match e {
+                    TryRecvError::Empty => {}
+                    TryRecvError::Disconnected => return true,
+                },
+            }
+        }
+        false
     }
 }
 
