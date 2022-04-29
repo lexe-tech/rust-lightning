@@ -175,8 +175,6 @@ fn init_channels() -> (
 
 // TODO refactor setup_inbound into setup with an enum for inbound / outbound
 
-// TODO implement a From trait for IpAddr -> NetAddress
-
 /// An synchronous SocketDescriptor (i.e. it doesn't rely on Tokio)
 /// TODO Describe what this SocketDescriptor *is* as well as what it *does*; to
 /// a newcomer it's probably not immediately clear
@@ -270,16 +268,16 @@ impl SocketDescriptor for SyncSocketDescriptor {
         }
     }
 
-    // TODO shouldn't the PeerManager be notified if there has been a disconnect?
-
     /// There are several ways that a disconnect might be triggered:
     /// 1) The Reader receives Ok(0) or Err from TcpStream::read(), i.e. the
     ///    peer disconnected.
-    /// 2) The Reader receives Err from PeerManager::read_event(), i.e.
+    /// 2) The Reader receives Err from PeerManager::read_event(); i.e.
     ///    Rust-Lightning told us to disconnect from the peer.
     /// 3) The Writer receives Ok(0) from TcpStream::write() (undocumented
     ///    behavior), or an Err(ErrorKind) that shouldn't be retried.
-    /// 4) This function is called.
+    /// 4) The Writer receives Err from PeerManager::write_buffer_space_avail();
+    ///    Rust-Lightning told us to disconnect from the peer.
+    /// 5) This function is called.
     ///
     /// The disconnect will be handled differently depending on the source of
     /// the trigger:
@@ -295,8 +293,9 @@ impl SocketDescriptor for SyncSocketDescriptor {
     ///     because while the writer is blocked on write(), the only way it can
     ///     unblock is by detecting the TCP disconnect.
     ///
-    /// - (3): If the Writer received the trigger, it will shut down BOTH halves
-    ///   of the shared TcpStream AND send a Shutdown command to the Reader.
+    /// - (3) and (4): If the Writer received the trigger, it will shut down
+    ///   BOTH halves of the shared TcpStream AND send a Shutdown command to the
+    ///   Reader.
     ///
     ///   - The explicit Shutdown command from the Writer is necessary because
     ///     if the Reader is blocked on `reader_cmd_rx.recv()` due to
@@ -306,13 +305,17 @@ impl SocketDescriptor for SyncSocketDescriptor {
     ///     because while the reader is blocked on read(), the only way it can
     ///     unblock is by detecting the TCP disconnect.
     ///
-    /// - (4): If the disconnect was initiated here, a Shutdown command will be
+    /// - (5): If the disconnect was initiated here, a Shutdown command will be
     ///   sent to both the Reader and the Writer, AND the TcpDisconnectooor will
     ///   shutdown both halves of the shared TCP stream. The Shutdown command
     ///   ensures that the Reader / Writer will unblock if they are currently
     ///   blocked on `recv()`. The TCP stream shutdown ensures that they will
     ///   unblock if they are currently blocked on `read()` or `write()`
     ///   respectively.
+    ///
+    /// In cases (1) and (3), the disconnect was NOT initiated by
+    /// Rust-Lightning, so the Reader / Writer notify the PeerManager using
+    /// `socket_disconnected()`.
     fn disconnect_socket(&mut self) {
         let _ = self.reader_cmd_tx.try_send(ReaderCommand::Shutdown);
         let _ = self.writer_cmd_tx.try_send(WriterCommand::Shutdown);
@@ -324,7 +327,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
 enum ReaderCommand {
     ResumeRead,
     PauseRead,
-    Shutdown, // TODO undo implementing this
+    Shutdown,
 }
 
 // TODO Write doc description
@@ -395,7 +398,9 @@ where
                 // the loop and shut down.
                 match self.inner.read(&mut buf) {
                     Ok(0) | Err(_) => {
-                        // Peer disconnected
+                        // Peer disconnected. Notify the PeerManager then break
+                        self.peer_manager.socket_disconnected(&self.descriptor);
+                        self.peer_manager.process_events();
                         break;
                     }
                     Ok(bytes_read) => {
@@ -411,6 +416,7 @@ where
                             }
                             Err(_) => {
                                 // Rust-Lightning told us to disconnect; do it
+                                // No need to notify PeerManager in this case
                                 break;
                             }
                         }
@@ -536,6 +542,7 @@ where
 
     // TODO: Write comment describing this function
     #[allow(clippy::single_match)]
+    #[allow(clippy::comparison_chain)]
     fn run(&mut self) {
         use std::io::ErrorKind::*;
 
@@ -544,6 +551,17 @@ where
                 Some(buf) => {
                     // We have data in our internal buffer; attempt to write it
                     match self.inner.write(&buf[self.start..]) {
+                        Ok(0) => {
+                            // We received Ok, but nothing was written. The
+                            // behavior that produces this result is not clearly
+                            // defined in the docs, but it's probably safe to
+                            // assume that the correct response is to notify the
+                            // PeerManager of a disconnected peer, break the
+                            // loop, and shut down the TcpStream.
+                            self.peer_manager.socket_disconnected(&self.descriptor);
+                            self.peer_manager.process_events();
+                            break;
+                        }
                         Ok(bytes_written) => {
                             // Define end s.t. the data written was buf[start..end]
                             let end = self.start + bytes_written;
@@ -552,20 +570,12 @@ where
                                 // Everything was written, clear the buf and reset the start index
                                 self.buf = None;
                                 self.start = 0;
-                            } else if bytes_written > 0 && end < buf.len() {
+                            } else if end < buf.len() {
                                 // Partial write; the new start index is exactly where the current
                                 // write ended.
                                 self.start = end;
-                            } else if bytes_written == 0 {
-                                // We received Ok, but nothing was written.
-                                // The behavior that produces this result is not
-                                // clearly defined in the docs, but it's
-                                // probably safe to assume that the correct
-                                // response is to break the loop and shut down
-                                // the TcpStream.
-                                break;
                             } else {
-                                panic!("Unhandled case in Writer::run()");
+                                panic!("More bytes were written than were given");
                             }
                         }
                         Err(e) => {
@@ -580,7 +590,10 @@ where
                                     // Rust.
                                 }
                                 _ => {
-                                    // For all other errors, break and shut down
+                                    // For all other errors, notify the
+                                    // PeerManager, break, and shut down
+                                    self.peer_manager.socket_disconnected(&self.descriptor);
+                                    self.peer_manager.process_events();
                                     break;
                                 }
                             }
@@ -599,7 +612,16 @@ where
                                     self.start = 0;
                                 }
 
-                                // TODO call write_buffer_space_avail
+                                // There is space for the next send_data()
+                                // request; notify the PeerManager
+                                if self
+                                    .peer_manager
+                                    .write_buffer_space_avail(&mut self.descriptor)
+                                    .is_err()
+                                {
+                                    // PeerManager wants us to disconnect
+                                    break;
+                                }
                             }
                             WriterCommand::Shutdown => break,
                         },
