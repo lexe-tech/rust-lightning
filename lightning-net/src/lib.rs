@@ -293,8 +293,12 @@ impl Connection {
         let tcp_writer = TcpWriter(writer_stream);
         let tcp_disconnectooor = TcpDisconnectooor(disconnector_stream);
 
-        let mut writer: Writer<CMH, RMH, L, UMH> =
-            Writer::new(tcp_writer, writer_cmd_rx, peer_manager.clone());
+        let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
+            tcp_writer,
+            peer_manager.clone(),
+            reader_cmd_tx.clone(),
+            writer_cmd_rx,
+        );
         let socket_descriptor = SyncSocketDescriptor::new(
             id,
             tcp_disconnectooor.clone(),
@@ -302,8 +306,13 @@ impl Connection {
             writer_cmd_tx.clone(),
         );
 
-        let mut reader: Reader<CMH, RMH, L, UMH> =
-            Reader::new(tcp_reader, reader_cmd_rx, peer_manager, socket_descriptor);
+        let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
+            tcp_reader,
+            peer_manager,
+            reader_cmd_rx,
+            writer_cmd_tx,
+            socket_descriptor,
+        );
 
         // Spawn the reader and writer threads. Using a synchronous runtime
         // requires that there are dedicated threads for reading and writing.
@@ -337,6 +346,7 @@ where
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     descriptor: SyncSocketDescriptor,
     reader_cmd_rx: Receiver<ReaderCommand>,
+    writer_cmd_tx: Sender<WriterCommand>,
     read_paused: bool,
 }
 impl<CMH, RMH, L, UMH> Reader<CMH, RMH, L, UMH>
@@ -348,14 +358,16 @@ where
 {
     fn new(
         reader: TcpReader,
-        reader_cmd_rx: Receiver<ReaderCommand>,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+        reader_cmd_rx: Receiver<ReaderCommand>,
+        writer_cmd_tx: Sender<WriterCommand>,
         descriptor: SyncSocketDescriptor,
     ) -> Self {
         Self {
             inner: reader,
             peer_manager,
             reader_cmd_rx,
+            writer_cmd_tx,
             descriptor,
             read_paused: false,
         }
@@ -476,6 +488,7 @@ where
 {
     inner: TcpWriter,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    reader_cmd_tx: Sender<ReaderCommand>,
     writer_cmd_rx: Receiver<WriterCommand>,
     /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
@@ -509,12 +522,14 @@ where
     /// Generates a Writer and associated `writer_cmd_tx` from a TcpWriter
     fn new(
         writer: TcpWriter,
-        writer_cmd_rx: Receiver<WriterCommand>,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+        reader_cmd_tx: Sender<ReaderCommand>,
+        writer_cmd_rx: Receiver<WriterCommand>,
     ) -> Self {
         Self {
             inner: writer,
             peer_manager,
+            reader_cmd_tx,
             writer_cmd_rx,
             buf: None,
             start: 0,
