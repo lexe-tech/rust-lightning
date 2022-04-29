@@ -70,25 +70,32 @@ where
     L: Logger + 'static + ?Sized + Send + Sync,
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
-    // Initialize all the channels. It has to be done here because otherwise there
-    // is a circular dependency between the Connection and SyncSocketDescriptors
+    // Initialize all the channels.
 
     // No reason to bound this channel
     let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
-    // Only one command can be in the channel at a time. This way, senders can
-    // know that previous writes are still processing when tx.try_send() returns
-    // an Err(TrySendError::Full).
+
+    // This channel is size 2 so as to have 1 dedicated space for each type of
+    // WriterCommand: WriteData and Shutdown. A Shutdown command can be pushed
+    // into the channel at any time, but to ensure that there is always space
+    // for it, send_data() will only ever push a WriteData command into the
+    // channel after it first detects that the channel is completely empty.
     //
-    // This channel between the Writer and the holders of the
-    // Sender<WriterCommand>s can be thought of as a second buffer, where the
-    // first buffer is the Writer internal buffer (`self.buf`) and
-    // the third buffer is the &[u8] passed into send_data().
+    // The reason we can't have a second dedicated channel for sending Shutdown
+    // commands to the Writer is that, being in a synchronous context, the
+    // Writer can only block on one channel at once, which means that in the
+    // case of two channels it could wait for WriteData commands or Shutdown
+    // commands, but not both.
     //
-    // TODO this needs to be rewritten to reflect the refactor into commands
+    // Allocating only one slot in the channel for WriteData commands allows
+    // send_data() to quickly detect that writes are still processing.
+    // This space can be thought of as a second buffer, where the first buffer
+    // is the Writer internal buffer (`self.buf`) and the third buffer is the
+    // &[u8] passed into send_data().
     let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::bounded(2);
 
     let ip_addr = stream.peer_addr().unwrap();
-    let (conn, disconnectooor) = Connection::init(
+    let conn = Connection::init(
         stream,
         peer_manager.clone(),
         reader_cmd_tx.clone(),
@@ -99,8 +106,7 @@ where
     let am_conn = Arc::new(Mutex::new(conn));
     let conn_id = { am_conn.lock().unwrap().id };
     // TODO get the connection id as a return value of Connection::init()
-    let mut socket_descriptor =
-        SyncSocketDescriptor::new(conn_id, disconnectooor, reader_cmd_tx, writer_cmd_tx);
+    let mut socket_descriptor = SyncSocketDescriptor::new(conn_id, reader_cmd_tx, writer_cmd_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -133,7 +139,6 @@ where
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
-    tcp_disconnector: TcpDisconnectooor,
     reader_cmd_tx: Sender<ReaderCommand>,
     writer_cmd_tx: Sender<WriterCommand>,
 }
@@ -151,13 +156,11 @@ impl hash::Hash for SyncSocketDescriptor {
 impl SyncSocketDescriptor {
     fn new(
         connection_id: u64,
-        tcp_disconnector: TcpDisconnectooor,
         reader_cmd_tx: Sender<ReaderCommand>,
         writer_cmd_tx: Sender<WriterCommand>,
     ) -> Self {
         Self {
             id: connection_id,
-            tcp_disconnector,
             reader_cmd_tx,
             writer_cmd_tx,
         }
@@ -186,28 +189,37 @@ impl SocketDescriptor for SyncSocketDescriptor {
             let _ = self.reader_cmd_tx.try_send(ReaderCommand::ResumeRead);
         }
 
-        // The data must be copied here since a &[u8] reference cannot be safely
-        // sent across threads. This incurs a small amount of overhead.
-        let cmd = WriterCommand::WriteData(data.to_vec());
-        // TODO use Sender::len() to check there is enough space for shutdown message
-        match self.writer_cmd_tx.try_send(cmd) {
-            Ok(()) => {
-                // Data was successfully sent to the Writer.
-                data.len()
+        // To ensure that there is always space for a Shutdown command, only
+        // push data into the writer_cmd channel if it is currently empty.
+        if self.writer_cmd_tx.is_empty() {
+            // The data must be copied into the channel since a &[u8] reference
+            // cannot be sent across threads. This incurs a small amount of overhead.
+            let cmd = WriterCommand::WriteData(data.to_vec());
+            match self.writer_cmd_tx.try_send(cmd) {
+                Ok(()) => {
+                    // Data was successfully sent to the Writer.
+                    data.len()
+                }
+                Err(e) => match e {
+                    TrySendError::Full(_) => {
+                        // This could only happen if both channel slots were
+                        // consumed in between the if check above and now - a
+                        // TOCTTOU error. This shouldn't happen, but let's just
+                        // proceed as normal: pause reads and return 0
+                        let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
+                        0
+                    }
+                    TrySendError::Disconnected(_) => {
+                        // This might happen if the Writer detected a disconnect and
+                        // shut down on its own. Return 0.
+                        0
+                    }
+                },
             }
-            Err(e) => match e {
-                TrySendError::Full(_) => {
-                    // Busy writing, time to pause read
-                    // Still doesn't matter whether the send is Ok or Err
-                    let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
-                    0
-                }
-                TrySendError::Disconnected(_) => {
-                    // This might happen if the Writer detected a disconnect and
-                    // shut down on its own. Return 0.
-                    0
-                }
-            },
+        } else {
+            // There wasn't any space in the channel to hold the data. Pause.
+            let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
+            0
         }
     }
 
@@ -219,40 +231,58 @@ impl SocketDescriptor for SyncSocketDescriptor {
     /// 2) The Reader receives Err from PeerManager::read_event(), i.e.
     ///    Rust-Lightning told us to disconnect from the peer.
     /// 3) The Writer receives Ok(0) from TcpStream::write() (undocumented
-    ///    behavior), or an ErrorKind that shouldn't be retried.
-    /// 4) This function (`SocketDescriptor::disconnect_socket`) is called.
+    ///    behavior), or an Err(ErrorKind) that shouldn't be retried.
+    /// 4) This function is called.
     ///
-    /// In all four cases, `TcpStream::shutdown(Shutdown::Both)` will end up
-    /// being called, letting any Readers or Writers currently blocked on
-    /// `read()` or `write()` receive `Ok(0)` or `Err`, respectively.
+    /// The disconnect will be handled differently depending on the source of
+    /// the trigger:
+    /// - (1) and (2): If the Reader received the trigger, it will shut down
+    ///   BOTH halves of the shared TcpStream AND send a Shutdown command to the
+    ///   Reader.
     ///
-    /// There are two edge cases:
+    ///   - The explicit Shutdown command from the Reader is necessary because
+    ///     if the Reader is blocked on `writer_cmd_rx.recv()` due to
+    ///     its internal buffer being empty, the only way it can be unblocked is
+    ///     by receiving a command, in this case the Shutdown command.
+    ///   - The Reader closing both halves of the TCP stream is necessary
+    ///     because while the writer is blocked on write(), the only way it can
+    ///     unblock is by detecting the TCP disconnect.
     ///
-    /// - The first edge case is if Reader has read_paused set to true, in which
-    ///   case it will be blocked on the reader_cmd channel.
-    /// - The second edge case if if Writer doesn't have any data to write in
-    ///   its internal `buf`, in which case it is blocked on the writer_cmd
-    ///   channel.
+    /// - (3): If the Writer received the trigger, it will shut down BOTH halves
+    ///   of the shared TcpStream AND send a Shutdown command to the Reader.
     ///
-    /// In both cases, only once all `SyncSocketDescriptors` are dropped,
-    /// thereby dropping all of the `reader_cmd_tx`s and `writer_cmd_tx`s ,
-    /// will the Reader and Writer detect a disconnected channel and proceed to
-    /// shut down.
+    ///   - The explicit Shutdown command from the Writer is necessary because
+    ///     if the Reader is blocked on `reader_cmd_rx.recv()` due to
+    ///     `read_paused == true`, the only way it can be unblocked is by
+    ///     receiving a command, in this case the Shutdown command.
+    ///   - The Writer closing both halves of the TCP stream is necessary
+    ///     because while the reader is blocked on read(), the only way it can
+    ///     unblock is by detecting the TCP disconnect.
+    ///
+    /// - (4): If the disconnect was initiated here, a Shutdown command will be
+    ///   sent to both the Reader and the Writer, AND the TcpDisconnectooor will
+    ///   shutdown both halves of the shared TCP stream. The Shutdown command
+    ///   ensures that the Reader / Writer will unblock if they are currently
+    ///   blocked on `recv()`. The TCP stream shutdown ensures that they will
+    ///   unblock if they are currently blocked on `read()` or `write()`
+    ///   respectively.
     fn disconnect_socket(&mut self) {
-        let _ = self.tcp_disconnector.shutdown();
+        let _ = self.reader_cmd_tx.try_send(ReaderCommand::Shutdown);
+        let _ = self.writer_cmd_tx.try_send(WriterCommand::Shutdown);
+        // TODO implement the TcpDisconnectooor
     }
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// TODO Since all this struct holds is an id and all it does is init(), all of
+// its logic can be refactored away into setup()
 /// Represents a TCP connection to a peer.
 ///
 /// There should only be one `Connection` struct per TCP connection
 /// (hence by init() takes ownership of the underlying TcpStream).
 struct Connection {
     id: u64,
-    /// Whether reads are paused. See send_data() docs
-    read_paused: bool,
 }
 impl Connection {
     /// Generates a new Connection given an existing TcpStream and spawns
@@ -277,7 +307,7 @@ impl Connection {
         reader_cmd_rx: Receiver<ReaderCommand>,
         writer_cmd_tx: Sender<WriterCommand>,
         writer_cmd_rx: Receiver<WriterCommand>,
-    ) -> (Self, TcpDisconnectooor)
+    ) -> Self
     where
         CMH: ChannelMessageHandler + 'static + Send + Sync,
         RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -287,11 +317,9 @@ impl Connection {
         let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
 
         let writer_stream = original_stream.try_clone().unwrap();
-        let disconnector_stream = writer_stream.try_clone().unwrap();
 
         let tcp_reader = TcpReader(original_stream);
         let tcp_writer = TcpWriter(writer_stream);
-        let tcp_disconnectooor = TcpDisconnectooor(disconnector_stream);
 
         let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
             tcp_writer,
@@ -299,12 +327,7 @@ impl Connection {
             reader_cmd_tx.clone(),
             writer_cmd_rx,
         );
-        let socket_descriptor = SyncSocketDescriptor::new(
-            id,
-            tcp_disconnectooor.clone(),
-            reader_cmd_tx,
-            writer_cmd_tx.clone(),
-        );
+        let socket_descriptor = SyncSocketDescriptor::new(id, reader_cmd_tx, writer_cmd_tx.clone());
 
         let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
             tcp_reader,
@@ -319,12 +342,7 @@ impl Connection {
         thread::spawn(move || reader.run());
         thread::spawn(move || writer.run());
 
-        let me = Self {
-            id,
-            read_paused: false,
-        };
-
-        (me, tcp_disconnectooor)
+        Self { id }
     }
 }
 
@@ -332,6 +350,7 @@ impl Connection {
 enum ReaderCommand {
     ResumeRead,
     PauseRead,
+    Shutdown, // TODO undo implementing this
 }
 
 // TODO Write doc description
@@ -390,8 +409,7 @@ where
             if self.read_paused {
                 // To avoid a busy loop while reading is paused, block on the
                 // reader_cmd channel until we are told to resume reading again
-                // or until all channel senders are dropped (in which case we
-                // will shut down).
+                // or until we receive a shut down command.
                 let shutdown = self.handle_command(true);
                 if shutdown {
                     break;
@@ -432,6 +450,8 @@ where
 
         // Shut down the underlying stream. It's fine if it was already closed.
         let _ = self.inner.shutdown();
+        // Send a signal to the Writer to do the same.
+        let _ = self.writer_cmd_tx.try_send(WriterCommand::Shutdown);
     }
 
     /// Handles a potential ReaderCommand in a blocking or non-blocking manner.
@@ -447,6 +467,7 @@ where
                     ReaderCommand::ResumeRead => {
                         self.read_paused = false;
                     }
+                    ReaderCommand::Shutdown => return true,
                 },
                 Err(_) => {
                     // The channel is disconnected, break and shut down
@@ -462,6 +483,7 @@ where
                     ReaderCommand::ResumeRead => {
                         self.read_paused = false;
                     }
+                    ReaderCommand::Shutdown => return true,
                 },
                 Err(e) => match e {
                     TryRecvError::Empty => {}
@@ -476,6 +498,7 @@ where
 /// Commands that can be sent to the Writer.
 enum WriterCommand {
     WriteData(Vec<u8>),
+    Shutdown,
 }
 
 // TODO Write doc description
@@ -590,7 +613,8 @@ where
                     }
                 }
                 None => {
-                    // We don't have data in our internal buffer; fetch more
+                    // We don't have data in our internal buffer; block on the
+                    // command channel
                     match self.writer_cmd_rx.recv() {
                         Ok(cmd) => match cmd {
                             WriterCommand::WriteData(data) => {
@@ -602,6 +626,7 @@ where
 
                                 // TODO call write_buffer_space_avail
                             }
+                            WriterCommand::Shutdown => break,
                         },
                         Err(_) => {
                             // Channel is empty and disconnected
@@ -616,11 +641,13 @@ where
 
         // Shut down the underlying stream. It's fine if it was already closed.
         let _ = self.inner.shutdown();
+        // Send a signal to the Reader to do the same.
+        let _ = self.reader_cmd_tx.try_send(ReaderCommand::Shutdown);
     }
 }
 
-/// A newtype for a TcpStream that can (and should) only be used for (1) reading
-/// and (2) shutting down both halves of the TcpStream. Managed by the `Reader`.
+/// A newtype for a TcpStream that can (and should) only be used for reading.
+/// Managed by the `Reader`.
 struct TcpReader(TcpStream);
 impl Read for TcpReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -628,18 +655,14 @@ impl Read for TcpReader {
     }
 }
 impl TcpReader {
-    /// Shuts down both the read and write halves of the underlying TcpStream.
-    ///
-    /// This allows the Reader to notify the Writer to shutdown, since the
-    /// Writer will receive an Err from their write() call when the write
-    /// half is closed.
+    /// Shuts down both halves of the underlying TcpStream.
     fn shutdown(&self) -> std::io::Result<()> {
         self.0.shutdown(Shutdown::Both)
     }
 }
 
-/// A newtype for a TcpStream that can (and should) only be used for (1) writing
-/// and (2) shutting down both halves of the TcpStream. Managed by the `Writer`.
+/// A newtype for a TcpStream that can (and should) only be used for writing.
+/// Managed by the `Writer`.
 struct TcpWriter(TcpStream);
 impl Write for TcpWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -650,18 +673,14 @@ impl Write for TcpWriter {
     }
 }
 impl TcpWriter {
-    /// Shuts down both the read and write halves of the underlying TcpStream.
-    ///
-    /// This allows the Writer to notify the Reader to shutdown, since the
-    /// Reader will receive an Ok(0) from their read() call when the read
-    /// half is closed.
+    /// Shuts down both halves of the underlying TcpStream.
     fn shutdown(&self) -> std::io::Result<()> {
         self.0.shutdown(Shutdown::Both)
     }
 }
 
 /// A newtype for a TcpStream that can (and should) only be used for shutting
-/// down both halves of the TcpStream. Managed by the `SyncSocketDescriptor`.
+/// down the TcpStream. Managed by the `SyncSocketDescriptor`s.
 struct TcpDisconnectooor(TcpStream);
 // @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 // @@@@@@@@@@@@@@%%%%%%%%%%@@@@@@@@@@@@
@@ -691,7 +710,7 @@ impl Clone for TcpDisconnectooor {
     }
 }
 impl TcpDisconnectooor {
-    /// Shuts down both the read and write halves of the underlying TcpStream.
+    /// Shuts down both halves of the underlying TcpStream.
     fn shutdown(&self) -> std::io::Result<()> {
         self.0.shutdown(Shutdown::Both)
     }
