@@ -58,10 +58,8 @@ use lightning::util::logger::Logger;
 ///
 /// This function only needs to be called once for every incoming connection.
 ///
-/// If the PeerManager accepts the connection, this function returns Ok with a
-/// std::thread::JoinHandle<()> for the thread managing the connection in case
-/// there is some need to `join` on it.
-pub fn spawn_inbound_handler<CMH, RMH, L, UMH>(
+/// Returns the result of calling PeerManager::new_inbound_connection(),
+pub fn setup_inbound<CMH, RMH, L, UMH>(
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     stream: TcpStream,
 ) -> Result<(), PeerHandleError>
@@ -109,6 +107,8 @@ where
             e
         })
 }
+
+// TODO refactor setup_inbound into setup with an enum for inbound / outbound
 
 // TODO implement a From trait for IpAddr -> NetAddress
 
@@ -195,7 +195,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
         }
     }
 
-    // TODO shouldn't the PeerManager be notified if the _ is _?
+    // TODO shouldn't the PeerManager be notified if there has been a disconnect?
 
     /// There are several ways that a disconnect might be triggered:
     /// 1) The Reader receives Ok(0) or Err from TcpStream::read(), i.e. the
@@ -275,7 +275,8 @@ impl Connection {
         let tcp_writer = TcpWriter(writer_stream);
         let tcp_disconnectooor = TcpDisconnectooor(disconnector_stream);
 
-        let (mut writer, write_data_tx) = Writer::new(tcp_writer);
+        let (mut writer, write_data_tx): (Writer<CMH, RMH, L, UMH>, Sender<Vec<u8>>) =
+            Writer::new(tcp_writer, peer_manager.clone());
         let socket_descriptor = SyncSocketDescriptor::new(
             id,
             tcp_disconnectooor.clone(),
@@ -350,7 +351,7 @@ where
 
         loop {
             // Every time this line is reached, read_paused == false.
-            // Do a non-blocking check to see if we've been asked to pause reads
+            // Do a non-blocking try_recv() to see if we've been asked to pause reads
             let shutdown = self.handle_command(false);
             if shutdown {
                 break;
@@ -392,8 +393,8 @@ where
                             }
                         }
 
-                        // TODO as noted in the docs for read_event(), we need
-                        // to call process_events().
+                        // As noted in the read_event() docs, call process_events().
+                        self.peer_manager.process_events()
                     }
                 }
             }
@@ -443,8 +444,15 @@ where
 }
 
 // TODO Write doc description
-struct Writer {
+struct Writer<CMH, RMH, L, UMH>
+where
+    CMH: ChannelMessageHandler + 'static + Send + Sync,
+    RMH: RoutingMessageHandler + 'static + Send + Sync,
+    L: Logger + 'static + ?Sized + Send + Sync,
+    UMH: CustomMessageHandler + 'static + Send + Sync,
+{
     inner: TcpWriter,
+    peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     write_data_rx: Receiver<Vec<u8>>,
     /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
@@ -468,9 +476,18 @@ struct Writer {
     /// be `None`.
     start: usize,
 }
-impl Writer {
+impl<CMH, RMH, L, UMH> Writer<CMH, RMH, L, UMH>
+where
+    CMH: ChannelMessageHandler + 'static + Send + Sync,
+    RMH: RoutingMessageHandler + 'static + Send + Sync,
+    L: Logger + 'static + ?Sized + Send + Sync,
+    UMH: CustomMessageHandler + 'static + Send + Sync,
+{
     /// Generates a Writer and associated `write_data_tx` from a TcpWriter
-    fn new(stream: TcpWriter) -> (Self, Sender<Vec<u8>>) {
+    fn new(
+        stream: TcpWriter,
+        peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
+    ) -> (Self, Sender<Vec<u8>>) {
         // Only one Vec<u8> can be in the channel at a time. This way, senders
         // can know that previous writes are still processing when tx.try_send()
         // returns an Err(TrySendError::Full).
@@ -482,6 +499,7 @@ impl Writer {
         let (write_data_tx, write_data_rx) = crossbeam::channel::bounded(1);
         let me = Self {
             inner: stream,
+            peer_manager,
             write_data_rx,
             buf: None,
             start: 0,
