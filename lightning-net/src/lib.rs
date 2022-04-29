@@ -24,7 +24,8 @@
 //!
 //! ## Overview of Channels in this crate
 //!
-//! - (`write_data_tx`, `write_data_rx`): A channel of `Vec<u8>`s with size 1
+//! TODO rewrite the writer_cmd_tx description
+//! - (`writer_cmd_tx`, `writer_cmd_rx`): A channel of `Vec<u8>`s with size 1
 //!   from a [`SyncSocketDescriptor`] (multiple) to a [`Writer`] (singular) used
 //!   for sending data to the [`Writer`] to send to the peer.
 //! - TODO reader_cmd_tx, reader_cmd_rx channel
@@ -74,18 +75,32 @@ where
 
     // No reason to bound this channel
     let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
+    // Only one command can be in the channel at a time. This way, senders can
+    // know that previous writes are still processing when tx.try_send() returns
+    // an Err(TrySendError::Full).
+    //
+    // This channel between the Writer and the holders of the
+    // Sender<WriterCommand>s can be thought of as a second buffer, where the
+    // first buffer is the Writer internal buffer (`self.buf`) and
+    // the third buffer is the &[u8] passed into send_data().
+    //
+    // TODO this needs to be rewritten to reflect the refactor into commands
+    let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::bounded(2);
 
     let ip_addr = stream.peer_addr().unwrap();
-    let (conn, disconnectooor, write_data_tx) = Connection::init(
+    let (conn, disconnectooor) = Connection::init(
         stream,
         peer_manager.clone(),
         reader_cmd_tx.clone(),
         reader_cmd_rx,
+        writer_cmd_tx.clone(),
+        writer_cmd_rx,
     );
     let am_conn = Arc::new(Mutex::new(conn));
     let conn_id = { am_conn.lock().unwrap().id };
+    // TODO get the connection id as a return value of Connection::init()
     let mut socket_descriptor =
-        SyncSocketDescriptor::new(conn_id, disconnectooor, reader_cmd_tx, write_data_tx);
+        SyncSocketDescriptor::new(conn_id, disconnectooor, reader_cmd_tx, writer_cmd_tx);
 
     let net_address = match ip_addr.ip() {
         IpAddr::V4(ip) => NetAddress::IPv4 {
@@ -120,7 +135,7 @@ pub struct SyncSocketDescriptor {
     id: u64,
     tcp_disconnector: TcpDisconnectooor,
     reader_cmd_tx: Sender<ReaderCommand>,
-    write_data_tx: Sender<Vec<u8>>,
+    writer_cmd_tx: Sender<WriterCommand>,
 }
 impl PartialEq for SyncSocketDescriptor {
     fn eq(&self, other: &Self) -> bool {
@@ -138,13 +153,13 @@ impl SyncSocketDescriptor {
         connection_id: u64,
         tcp_disconnector: TcpDisconnectooor,
         reader_cmd_tx: Sender<ReaderCommand>,
-        write_data_tx: Sender<Vec<u8>>,
+        writer_cmd_tx: Sender<WriterCommand>,
     ) -> Self {
         Self {
             id: connection_id,
             tcp_disconnector,
             reader_cmd_tx,
-            write_data_tx,
+            writer_cmd_tx,
         }
     }
 }
@@ -173,8 +188,9 @@ impl SocketDescriptor for SyncSocketDescriptor {
 
         // The data must be copied here since a &[u8] reference cannot be safely
         // sent across threads. This incurs a small amount of overhead.
-        let owned_data = data.to_vec();
-        match self.write_data_tx.try_send(owned_data) {
+        let cmd = WriterCommand::WriteData(data.to_vec());
+        // TODO use Sender::len() to check there is enough space for shutdown message
+        match self.writer_cmd_tx.try_send(cmd) {
             Ok(()) => {
                 // Data was successfully sent to the Writer.
                 data.len()
@@ -213,13 +229,13 @@ impl SocketDescriptor for SyncSocketDescriptor {
     /// There are two edge cases:
     ///
     /// - The first edge case is if Reader has read_paused set to true, in which
-    ///   case it will be blocked on the resume_read channel.
+    ///   case it will be blocked on the reader_cmd channel.
     /// - The second edge case if if Writer doesn't have any data to write in
-    ///   its internal `buf`, in which case it is blocked on the write_data
+    ///   its internal `buf`, in which case it is blocked on the writer_cmd
     ///   channel.
     ///
     /// In both cases, only once all `SyncSocketDescriptors` are dropped,
-    /// thereby dropping all of the `reader_cmd_tx`s and `write_data_tx`s ,
+    /// thereby dropping all of the `reader_cmd_tx`s and `writer_cmd_tx`s ,
     /// will the Reader and Writer detect a disconnected channel and proceed to
     /// shut down.
     fn disconnect_socket(&mut self) {
@@ -252,14 +268,16 @@ impl Connection {
     /// by the compiler due to their private tuple fields still being
     /// readable by the impls in this file.
     ///
-    /// init() additionally returns a `write_data_tx` which can be used to pass
+    /// init() additionally returns a `writer_cmd_tx` which can be used to pass
     /// data to the Writer to send over TCP.
     fn init<CMH, RMH, L, UMH>(
         original_stream: TcpStream,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         reader_cmd_tx: Sender<ReaderCommand>,
         reader_cmd_rx: Receiver<ReaderCommand>,
-    ) -> (Self, TcpDisconnectooor, Sender<Vec<u8>>)
+        writer_cmd_tx: Sender<WriterCommand>,
+        writer_cmd_rx: Receiver<WriterCommand>,
+    ) -> (Self, TcpDisconnectooor)
     where
         CMH: ChannelMessageHandler + 'static + Send + Sync,
         RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -275,13 +293,13 @@ impl Connection {
         let tcp_writer = TcpWriter(writer_stream);
         let tcp_disconnectooor = TcpDisconnectooor(disconnector_stream);
 
-        let (mut writer, write_data_tx): (Writer<CMH, RMH, L, UMH>, Sender<Vec<u8>>) =
-            Writer::new(tcp_writer, peer_manager.clone());
+        let mut writer: Writer<CMH, RMH, L, UMH> =
+            Writer::new(tcp_writer, writer_cmd_rx, peer_manager.clone());
         let socket_descriptor = SyncSocketDescriptor::new(
             id,
             tcp_disconnectooor.clone(),
             reader_cmd_tx,
-            write_data_tx.clone(),
+            writer_cmd_tx.clone(),
         );
 
         let mut reader: Reader<CMH, RMH, L, UMH> =
@@ -297,7 +315,7 @@ impl Connection {
             read_paused: false,
         };
 
-        (me, tcp_disconnectooor, write_data_tx)
+        (me, tcp_disconnectooor)
     }
 }
 
@@ -443,6 +461,11 @@ where
     }
 }
 
+/// Commands that can be sent to the Writer.
+enum WriterCommand {
+    WriteData(Vec<u8>),
+}
+
 // TODO Write doc description
 struct Writer<CMH, RMH, L, UMH>
 where
@@ -453,7 +476,7 @@ where
 {
     inner: TcpWriter,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
-    write_data_rx: Receiver<Vec<u8>>,
+    writer_cmd_rx: Receiver<WriterCommand>,
     /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
     ///
@@ -483,29 +506,19 @@ where
     L: Logger + 'static + ?Sized + Send + Sync,
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
-    /// Generates a Writer and associated `write_data_tx` from a TcpWriter
+    /// Generates a Writer and associated `writer_cmd_tx` from a TcpWriter
     fn new(
-        stream: TcpWriter,
+        writer: TcpWriter,
+        writer_cmd_rx: Receiver<WriterCommand>,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
-    ) -> (Self, Sender<Vec<u8>>) {
-        // Only one Vec<u8> can be in the channel at a time. This way, senders
-        // can know that previous writes are still processing when tx.try_send()
-        // returns an Err(TrySendError::Full).
-        //
-        // This channel between the Writer and the holders of the
-        // Sender<Vec<u8>>s can be thought of as a second buffer, where the
-        // first buffer is the Writer internal buffer (`self.buf`) and
-        // the third buffer is the &[u8] passed into send_data().
-        let (write_data_tx, write_data_rx) = crossbeam::channel::bounded(1);
-        let me = Self {
-            inner: stream,
+    ) -> Self {
+        Self {
+            inner: writer,
             peer_manager,
-            write_data_rx,
+            writer_cmd_rx,
             buf: None,
             start: 0,
-        };
-
-        (me, write_data_tx)
+        }
     }
 
     // TODO: Write comment describing this function
@@ -563,16 +576,18 @@ where
                 }
                 None => {
                     // We don't have data in our internal buffer; fetch more
-                    match self.write_data_rx.recv() {
-                        Ok(data) => {
-                            if !data.is_empty() {
-                                // Data fetched, add it to the buffer
-                                self.buf = Some(data);
-                                self.start = 0;
-                            }
+                    match self.writer_cmd_rx.recv() {
+                        Ok(cmd) => match cmd {
+                            WriterCommand::WriteData(data) => {
+                                if !data.is_empty() {
+                                    // Data fetched, add it to the buffer
+                                    self.buf = Some(data);
+                                    self.start = 0;
+                                }
 
-                            // TODO call write_buffer_space_avail
-                        }
+                                // TODO call write_buffer_space_avail
+                            }
+                        },
                         Err(_) => {
                             // Channel is empty and disconnected
                             // => no more messages can be sent
