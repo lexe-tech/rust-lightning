@@ -43,7 +43,7 @@ use core::hash;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -75,11 +75,12 @@ where
     // No reason to bound this channel
     let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
 
-    // This channel is size 2 so as to have 1 dedicated space for each type of
-    // WriterCommand: WriteData and Shutdown. A Shutdown command can be pushed
-    // into the channel at any time, but to ensure that there is always space
-    // for it, send_data() will only ever push a WriteData command into the
-    // channel after it first detects that the channel is completely empty.
+    // The WriterCommand channel is size 2 so as to have 1 dedicated space for
+    // each type of WriterCommand: WriteData and Shutdown. A Shutdown command
+    // can be pushed into the channel at any time, but to ensure that there is
+    // always space for it, send_data() will only ever push a WriteData command
+    // into the channel after it first detects that the channel is completely
+    // empty.
     //
     // The reason we can't have a second dedicated channel for sending Shutdown
     // commands to the Writer is that, being in a synchronous context, the
@@ -95,7 +96,8 @@ where
     let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::bounded(2);
 
     let ip_addr = stream.peer_addr().unwrap();
-    let conn = Connection::init(
+
+    let conn_id = Connection::init(
         stream,
         peer_manager.clone(),
         reader_cmd_tx.clone(),
@@ -103,8 +105,7 @@ where
         writer_cmd_tx.clone(),
         writer_cmd_rx,
     );
-    let am_conn = Arc::new(Mutex::new(conn));
-    let conn_id = { am_conn.lock().unwrap().id };
+
     // TODO get the connection id as a return value of Connection::init()
     let mut socket_descriptor = SyncSocketDescriptor::new(conn_id, reader_cmd_tx, writer_cmd_tx);
 
@@ -241,9 +242,9 @@ impl SocketDescriptor for SyncSocketDescriptor {
     ///   Reader.
     ///
     ///   - The explicit Shutdown command from the Reader is necessary because
-    ///     if the Reader is blocked on `writer_cmd_rx.recv()` due to
-    ///     its internal buffer being empty, the only way it can be unblocked is
-    ///     by receiving a command, in this case the Shutdown command.
+    ///     if the Reader is blocked on `writer_cmd_rx.recv()` due to its
+    ///     internal buffer being empty, the only way it can be unblocked is by
+    ///     receiving a command, in this case the Shutdown command.
     ///   - The Reader closing both halves of the TCP stream is necessary
     ///     because while the writer is blocked on write(), the only way it can
     ///     unblock is by detecting the TCP disconnect.
@@ -307,14 +308,15 @@ impl Connection {
         reader_cmd_rx: Receiver<ReaderCommand>,
         writer_cmd_tx: Sender<WriterCommand>,
         writer_cmd_rx: Receiver<WriterCommand>,
-    ) -> Self
+    ) -> u64
     where
         CMH: ChannelMessageHandler + 'static + Send + Sync,
         RMH: RoutingMessageHandler + 'static + Send + Sync,
         L: Logger + 'static + ?Sized + Send + Sync,
         UMH: CustomMessageHandler + 'static + Send + Sync,
     {
-        let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
+        // TODO
+        let conn_id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
 
         let writer_stream = original_stream.try_clone().unwrap();
 
@@ -327,7 +329,8 @@ impl Connection {
             reader_cmd_tx.clone(),
             writer_cmd_rx,
         );
-        let socket_descriptor = SyncSocketDescriptor::new(id, reader_cmd_tx, writer_cmd_tx.clone());
+        let socket_descriptor =
+            SyncSocketDescriptor::new(conn_id, reader_cmd_tx, writer_cmd_tx.clone());
 
         let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
             tcp_reader,
@@ -342,7 +345,7 @@ impl Connection {
         thread::spawn(move || reader.run());
         thread::spawn(move || writer.run());
 
-        Self { id }
+        conn_id
     }
 }
 
