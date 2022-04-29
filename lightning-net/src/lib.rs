@@ -79,16 +79,20 @@ where
     let conn_id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
     let socket_addr = stream.peer_addr().unwrap();
 
-    // Init SyncSocketDescriptor
-    let mut socket_descriptor =
-        SyncSocketDescriptor::new(conn_id, reader_cmd_tx.clone(), writer_cmd_tx.clone());
-
     // Init TcpReader, TcpWriter, TcpDisconnectooor
     let writer_stream = stream.try_clone().unwrap();
-    // let disconnector_stream = stream.try_clone().unwrap();
+    let disconnector_stream = stream.try_clone().unwrap();
     let tcp_reader = TcpReader(stream);
     let tcp_writer = TcpWriter(writer_stream);
-    // let tcp_disconnector = TcpDisconnectooor(disconnector_stream);
+    let tcp_disconnector = TcpDisconnectooor(disconnector_stream);
+
+    // Init SyncSocketDescriptor
+    let mut socket_descriptor = SyncSocketDescriptor::new(
+        conn_id,
+        tcp_disconnector,
+        reader_cmd_tx.clone(),
+        writer_cmd_tx.clone(),
+    );
 
     // Init Reader and Writer
     let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
@@ -178,6 +182,7 @@ fn init_channels() -> (
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
+    tcp_disconnector: TcpDisconnectooor,
     reader_cmd_tx: Sender<ReaderCommand>,
     writer_cmd_tx: Sender<WriterCommand>,
 }
@@ -195,11 +200,13 @@ impl hash::Hash for SyncSocketDescriptor {
 impl SyncSocketDescriptor {
     fn new(
         connection_id: u64,
+        tcp_disconnector: TcpDisconnectooor,
         reader_cmd_tx: Sender<ReaderCommand>,
         writer_cmd_tx: Sender<WriterCommand>,
     ) -> Self {
         Self {
             id: connection_id,
+            tcp_disconnector,
             reader_cmd_tx,
             writer_cmd_tx,
         }
@@ -308,7 +315,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
     fn disconnect_socket(&mut self) {
         let _ = self.reader_cmd_tx.try_send(ReaderCommand::Shutdown);
         let _ = self.writer_cmd_tx.try_send(WriterCommand::Shutdown);
-        // TODO implement the TcpDisconnectooor
+        let _ = self.tcp_disconnector.shutdown();
     }
 }
 
