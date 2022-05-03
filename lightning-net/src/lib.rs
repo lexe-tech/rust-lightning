@@ -7,40 +7,54 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+//! # lightning-net
+//!
 //! A socket handling library for those using rust-lightning within a
-//! synchronous, multi-threaded runtime, including inside SGX.
+//! synchronous, multi-threaded runtime.
 //!
 //! Whereas `lightning-net-tokio` manages reading and writing to peers using
 //! Futures and Tokio tasks, this library uses dedicated blocking threads. While
-//! this does result in a small amount of performance overhead, the complete
+//! this does result in a small amount of performance overhead, the
 //! absence of any Tokio `net` features means that this library can successfully
-//! compile and run with the `x86_64-fortanix-unknown-sgx` (EDP) target.
+//! compile to the `x86_64-fortanix-unknown-sgx` (Fortanix EDP) target.
+//! Compiling for SGX was the primary motivation for writing this crate, but
+//! this crate can also be useful for those who simply want to use
+//! rust-lightning without Tokio or async Rust.
+//!
+//! The primary entrypoints into this crate are `initiate_outbound()` and
+//! `handle_connection()`. See their individual docs for details.
+//!
+//! ## `std` limitations of EDP
+//!
+//! Compiling for Fortanix EDP comes with additional limitations, however. This
+//! crate purposefully avoids the use of:
+//!
+//! - `std::time::Instant::now`
+//! - `std::time::Instant::elapsed`
+//! - `std::time::SystemTime::now`
+//! - `std::time::SystemTime::elapsed`
+//! - `std::thread::sleep`
+//! - `std::thread::sleep_ms`
+//! - `std::thread::park_timeout`
+//! - `std::thread::park_timeout_ms`
+//! - `std::net::TcpStream::shutdown`
+//! - `std::net::TcpStream::connect_timeout`
+//! - `std::net::TcpStream::set_read_timeout`
+//! - `std::net::TcpStream::set_write_timeout`
+//! - `std::net::TcpStream::set_nodelay`
+//! - `std::net::TcpStream::set_ttl`
+//! - `std::net::TcpStream::set_nonblocking`
+//! - `std::net::TcpListener::set_nodelay`
+//! - `std::net::TcpListener::set_only_v6`
+//! - `std::net::TcpListener::set_nonblocking`
+//!
+//! These functions have varying degrees of compatibility with Fortanix EDP.
 //! See the [EDP docs](https://edp.fortanix.com/docs/concepts/rust-std/) for
 //! more information on what Rust features can and cannot be used within SGX.
-//!
-//! TODO Make note of especially the limitations in timeouts and stream
-//! networking
-//!
-//! Those who wish to maximize performance should use `lightning-net-tokio`.
-//! Those who want to run rust-lightning with a synchronous runtime, smaller
-//! code size, or no dependency or Tokio, should use this crate.
-//!
-//! ## Overview of Channels in this crate
-//!
-//! TODO rewrite the writer_cmd_tx description
-//! - (`writer_cmd_tx`, `writer_cmd_rx`): A channel of `Vec<u8>`s with size 1
-//!   from a [`SyncSocketDescriptor`] (multiple) to a [`Writer`] (singular) used
-//!   for sending data to the [`Writer`] to send to the peer.
-//! - TODO reader_cmd_tx, reader_cmd_rx channel
-//! - TODO complete
-//!
-//! # Example Usage
-//! # TODO
 
 #![deny(rustdoc::broken_intra_doc_links)]
 #![allow(clippy::type_complexity)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-#![allow(dead_code)] // TODO: Remove when complete
 
 use core::hash;
 use std::io::{Read, Write};
@@ -66,8 +80,8 @@ use lightning::util::logger::Logger;
 /// instantly, initiate_outbound() will block on the TcpStream::connect() call.
 ///
 /// If TcpStream::connect() succeeds, this function returns Ok() containing
-/// the return value of handle_connection(). Otherwise, an Err containing the
-/// std::io::Error is returned.
+/// the return value of handle_connection() (which is itself a Result).
+/// Otherwise, an Err containing the std::io::Error is returned.
 pub fn initiate_outbound<CMH, RMH, L, UMH>(
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     their_node_id: PublicKey,
@@ -91,7 +105,7 @@ where
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the new connection was initiated by the peer (inbound) or initiated
-/// by us (outbound). If the new connection was outbound, the PublicKey
+/// by us (outbound). If the new connection was outbound, the public key
 /// representing the node ID of the peer must be specified.
 pub enum ConnectionType {
     Inbound,
@@ -205,44 +219,81 @@ fn to_net(socket_addr: SocketAddr) -> NetAddress {
     }
 }
 
-/// Initializes all the crossbeam channels.
+/// Commands that can be sent to the Reader.
+enum ReaderCommand {
+    ResumeRead,
+    PauseRead,
+    Shutdown,
+}
+
+/// Commands that can be sent to the Writer.
+enum WriterCommand {
+    WriteData(Vec<u8>),
+    Shutdown,
+}
+
+/// Initializes the crossbeam channels for sending `ReaderCommand`s and
+/// `WriterCommand`s.
+///
+/// The `ReaderCommand` channel is unbounded, and can be used to tell the
+/// `Reader` to resume reads, pause reads, or shut down.
+///
+/// The `WriterCommand` channel has a capacity of 2, and can be used to tell the
+/// `Writer` to write a Vec<u8> of data, or shut down.
+///
+/// - The WriterCommand channel is size 2 so as to have 1 dedicated space for
+///   each type of WriterCommand: WriteData and Shutdown. A Shutdown command can
+///   be pushed into the channel at any time, but to ensure that there is always
+///   space for it, send_data() will only ever push a WriteData command into the
+///   channel after it first detects that the channel is completely empty.
+/// - The reason we can't have a second dedicated channel for sending Shutdown
+///   commands to the Writer is that, being in a synchronous context, the Writer
+///   can only block on one channel at once, which means that in the case of two
+///   channels it could wait for WriteData commands or Shutdown commands, but
+///   not both.
+/// - Allocating only one slot in the channel for WriteData commands allows
+///   send_data() to quickly detect that writes are still processing. This space
+///   can be thought of as a second buffer, where the first buffer is the Writer
+///   internal buffer (`self.buf`) and the third buffer is the &[u8] passed into
+///   send_data().
+///
+/// Finally:
+///
+/// - A `SyncSocketDescriptor` holds a `Sender` for both the `ReaderCommand` and
+///   `WriterCommand` channels.
+/// - A `Reader` holds a `Sender` for the `WriterCommand` channel, and a
+///   `Writer` holds a `Sender` for the `ReaderCommand` channel.
 fn init_channels() -> (
     Sender<ReaderCommand>,
     Receiver<ReaderCommand>,
     Sender<WriterCommand>,
     Receiver<WriterCommand>,
 ) {
-    // No reason to bound this channel
     let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
 
-    // The WriterCommand channel is size 2 so as to have 1 dedicated space for
-    // each type of WriterCommand: WriteData and Shutdown. A Shutdown command
-    // can be pushed into the channel at any time, but to ensure that there is
-    // always space for it, send_data() will only ever push a WriteData command
-    // into the channel after it first detects that the channel is completely
-    // empty.
-    //
-    // The reason we can't have a second dedicated channel for sending Shutdown
-    // commands to the Writer is that, being in a synchronous context, the
-    // Writer can only block on one channel at once, which means that in the
-    // case of two channels it could wait for WriteData commands or Shutdown
-    // commands, but not both.
-    //
-    // Allocating only one slot in the channel for WriteData commands allows
-    // send_data() to quickly detect that writes are still processing.
-    // This space can be thought of as a second buffer, where the first buffer
-    // is the Writer internal buffer (`self.buf`) and the third buffer is the
-    // &[u8] passed into send_data().
     let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::bounded(2);
 
     (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx)
 }
 
-/// An synchronous SocketDescriptor (i.e. it doesn't rely on Tokio)
-/// TODO Describe what this SocketDescriptor *is* as well as what it *does*; to
-/// a newcomer it's probably not immediately clear
+/// A concrete implementation of the SocketDescriptor.
 ///
-/// Public only because it is the concrete type required by handle_connection()
+/// A SyncSocketDescriptor is essentially a `clone()`able handle to an
+/// underlying connection as well as an identifier for that connection.
+///
+/// It consists of an ID representing the unique connection to the peer,
+/// crossbeam channel `Sender`s for the `Reader` and `Writer`, and a
+/// `TcpDisconnectooor` that can be used to shut down the underlying `TcpStream`
+/// in the event that both the `Reader` and the `Writer` are blocked on
+/// `recv()`ing from their crossbeam channels.
+///
+/// A `SyncSocketDescriptor` allows a `PeerManager` to manage a connection via
+/// its calls to `send_data()` and `disconnect_socket()`. Furthermore,
+/// the `Reader` and `Writer` each hold a copy to pass along with their
+/// calls into the `PeerManager`, so that the `PeerManager` can identify which
+/// connection is currently being processed during calls into the `PeerManager`.
+///
+/// This type is public only because handle_connection() requires it to be.
 #[derive(Clone)]
 pub struct SyncSocketDescriptor {
     id: u64,
@@ -277,8 +328,9 @@ impl SyncSocketDescriptor {
     }
 }
 impl SocketDescriptor for SyncSocketDescriptor {
-    /// TODO Write in a high level description of what this function (and more
-    /// generally the SocketDescriptor) *does*
+    /// Attempts to queue up some data from the given slice for the `Writer` to
+    /// send. Returns the number of bytes that were successfully pushed to the
+    /// `WriterCommand` channel.
     ///
     /// This implementation never calls back into the PeerManager directly,
     /// thereby preventing reentrancy / deadlock issues. Instead, any commands
@@ -291,7 +343,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
     /// amount of time that the PeerManager's internal locks are held.
     fn send_data(&mut self, data: &[u8], resume_read: bool) -> usize {
         if resume_read {
-            // It doesn't matter whether the send is Ok or Err
+            // It doesn't matter whether the channel send is Ok or Err
             let _ = self.reader_cmd_tx.try_send(ReaderCommand::ResumeRead);
         }
 
@@ -314,8 +366,8 @@ impl SocketDescriptor for SyncSocketDescriptor {
                     TrySendError::Full(_) => {
                         // This could only happen if both channel slots were
                         // consumed in between the if check above and now - a
-                        // TOCTTOU error. This shouldn't happen, but let's just
-                        // proceed as normal: pause reads and return 0
+                        // TOCTTOU error. This really shouldn't happen, but
+                        // let's just proceed normally: pause reads and return 0
                         let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
                         0
                     }
@@ -327,19 +379,22 @@ impl SocketDescriptor for SyncSocketDescriptor {
                 },
             }
         } else {
-            // There wasn't any space in the channel to hold the data. Pause.
+            // There wasn't enough space in the channel to hold the data AND
+            // leave an empty space for a potential Shutdown command. Pause.
             let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
             0
         }
     }
 
+    /// Shuts down the Reader, Writer, and the underlying TcpStream.
+    ///
     /// There are several ways that a disconnect might be triggered:
     /// 1) The Reader receives Ok(0) from TcpStream::read() (i.e. the
-    ///    peer disconnected), or an Err that shouldn't be retried.
+    ///    peer disconnected), or an Err(io::Error) that shouldn't be retried.
     /// 2) The Reader receives Err from PeerManager::read_event(); i.e.
     ///    Rust-Lightning told us to disconnect from the peer.
     /// 3) The Writer receives Ok(0) from TcpStream::write() (undocumented
-    ///    behavior), or an Err(ErrorKind) that shouldn't be retried.
+    ///    behavior), or an Err(io::Error) that shouldn't be retried.
     /// 4) The Writer receives Err from PeerManager::write_buffer_space_avail();
     ///    Rust-Lightning told us to disconnect from the peer.
     /// 5) This function is called.
@@ -388,14 +443,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
     }
 }
 
-/// Commands that can be sent to the Reader.
-enum ReaderCommand {
-    ResumeRead,
-    PauseRead,
-    Shutdown,
-}
-
-// TODO Write doc description
+/// An actor that synchronously handles the read() events emitted by the socket.
 struct Reader<CMH, RMH, L, UMH>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
@@ -434,7 +482,15 @@ where
         }
     }
 
-    // TODO write function description
+    /// Handle read events, or wait for the next `ReaderCommand` if reads are
+    /// paused. This implementation avoids busy loops and lets the thread go to
+    /// sleep whenever reads or channel commands are pending.
+    ///
+    /// - If `self.read_paused`, block on `self.reader_cmd_rx.recv()` and handle
+    ///   any commands accordingly.
+    /// - If `!self.read_paused`, block on `self.inner.read()` and handle any
+    ///   read events accordingly.
+    /// - In between each event, do a non-blocking check for `ReaderCommand`s.
     fn run(&mut self) {
         use std::io::ErrorKind::*;
 
@@ -554,13 +610,8 @@ where
     }
 }
 
-/// Commands that can be sent to the Writer.
-enum WriterCommand {
-    WriteData(Vec<u8>),
-    Shutdown,
-}
-
-// TODO Write doc description
+/// An actor that synchronously initiates the write() events requested by the
+/// `PeerManager`.
 struct Writer<CMH, RMH, L, UMH>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
@@ -619,7 +670,22 @@ where
         }
     }
 
-    // TODO: Write comment describing this function
+    /// Process `WriteData` requests, or wait for the next `WriterCommand` if
+    /// the internal buffer is empty. This implementation avoids busy loops and
+    /// lets the thread go to sleep whenever writes or channel commands are
+    /// pending.
+    ///
+    /// - If `self.buf == None`, block on `self.reader_cmd_rx.recv()` and handle
+    ///   any commands accordingly.
+    /// - If `self.buf == Some(Vec<u8>)`, block on `self.inner.write()` and
+    ///   handle the response accordingly.
+    /// - The Writer does NOT check for pending `WriterCommands` in between each
+    ///   event. This is because we do NOT want to take a potential WriteData
+    ///   request out of the channel in the case that the Writer is currently
+    ///   failing to write the data in self.buf(). This way, a failing write
+    ///   will cause the next send_data() call to fill up the space dedicated
+    ///   for WriteData commands, which in turn allows a later call to
+    ///   send_data() to detect that writes are still pending.
     #[allow(clippy::single_match)]
     #[allow(clippy::comparison_chain)]
     fn run(&mut self) {
@@ -719,8 +785,8 @@ where
     }
 }
 
-/// A newtype for a TcpStream that can (and should) only be used for reading.
-/// Managed by the `Reader`.
+/// A newtype for a TcpStream that can (and should) only be used for reading and
+/// shutting down the stream. Managed by the `Reader`.
 struct TcpReader(TcpStream);
 impl Read for TcpReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -734,8 +800,8 @@ impl TcpReader {
     }
 }
 
-/// A newtype for a TcpStream that can (and should) only be used for writing.
-/// Managed by the `Writer`.
+/// A newtype for a TcpStream that can (and should) only be used for writing and
+/// shutting down the stream. Managed by the `Writer`.
 struct TcpWriter(TcpStream);
 impl Write for TcpWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
