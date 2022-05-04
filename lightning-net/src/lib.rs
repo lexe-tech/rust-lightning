@@ -9,25 +9,23 @@
 
 //! # lightning-net
 //!
-//! A socket handling library for those using rust-lightning within a
-//! synchronous, multi-threaded runtime.
+//! A socket handling library for those using rust-lightning without an async
+//! runtime.
 //!
 //! Whereas `lightning-net-tokio` manages reading and writing to peers using
 //! Futures and Tokio tasks, this library uses dedicated blocking threads. While
-//! this does result in a small amount of performance overhead, the
-//! absence of any Tokio `net` features means that this library can successfully
-//! compile to the `x86_64-fortanix-unknown-sgx` (Fortanix EDP) target.
-//! Compiling for SGX was the primary motivation for writing this crate, but
-//! this crate can also be useful for those who simply want to use
-//! rust-lightning without Tokio or async Rust.
+//! this does result in a small amount of performance overhead, it allows
+//! rust-lightning to be used on platforms that don't support Tokio or async
+//! Rust.
 //!
 //! The primary entrypoints into this crate are `initiate_outbound()` and
 //! `handle_connection()`. See their individual docs for details.
 //!
 //! ## `std` limitations of EDP
 //!
-//! Compiling for Fortanix EDP comes with additional limitations, however. This
-//! crate purposefully avoids the use of:
+//! An additional goal of this crate is to compile to the Fortanix EDP
+//! (`x86_64-fortanix-unknown-sgx`) target. This comes with additional
+//! limitations, however. This crate purposefully avoids the use of:
 //!
 //! - `std::time::Instant::now`
 //! - `std::time::Instant::elapsed`

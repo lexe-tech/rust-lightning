@@ -8,7 +8,7 @@ description = """
 Implementation of the rust-lightning network stack for a synchronous runtime.
 For Rust-Lightning clients which wish to make direct connections to Lightning
 P2P nodes, this is a simple alternative to implementing the required network
-stack for those who do not want to use Tokio.
+stack for those who do not want to use async Rust or Tokio.
 """
 edition = "2018"
 
