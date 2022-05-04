@@ -168,14 +168,13 @@ where
         writer_cmd_rx,
     );
 
-    // Spawn the reader and writer threads. Using a synchronous runtime
-    // requires that there are dedicated threads for reading and writing.
-    thread::spawn(move || reader.run());
-    thread::spawn(move || writer.run());
-
-    // Notify the PeerManager of the new connection.
-    // If Ok, send the initial data if it was an outbound connection.
-    // If Err, disconnect the TcpStream and shutdown the Reader and Writer.
+    // Notify the PeerManager of the new connection depending on its ConnectionType.
+    //
+    // - If Ok, spawn the Reader and Writer threads.
+    // - If Ok and Outbound, additionally queue up the initial data.
+    // - If Err, disconnect the TcpStream and do not spawn the worker threads.
+    //
+    // In all cases, return the result of the call into the PeerManager.
     match conn_type {
         ConnectionType::Inbound => {
             peer_manager.new_inbound_connection(descriptor.clone(), Some(to_net(socket_addr)))
@@ -183,23 +182,31 @@ where
         ConnectionType::Outbound(their_node_id) => peer_manager
             .new_outbound_connection(their_node_id, descriptor.clone(), Some(to_net(socket_addr)))
             .map(|initial_data| {
-                // PeerManager accepted the connection; send the initial data
+                // PeerManager accepted the outbound connection; queue up the
+                // initial WriteData WriterCommand.
+                let bytes_pushed = descriptor.send_data(&initial_data, true);
                 // This should always succeed since send_data just pushes data
                 // into the writer_cmd channel and the writer_cmd channel always
                 // starts out completely empty. If pushing the initial 10s of
                 // bytes into the writer_cmd channel fails, something is very
                 // wrong; probably a programmer error.
-                let bytes_pushed = descriptor.send_data(&initial_data, true);
                 if bytes_pushed != initial_data.len() {
                     panic!("The initial write should always succeed");
                 }
             }),
     }
+    .map(|()| {
+        // PeerManager accepted the connection; kick off processing by spawning
+        // the Reader / Writer threads.
+        thread::spawn(move || reader.run());
+        thread::spawn(move || writer.run());
+    })
     .map_err(|e| {
-        // PeerManager rejected this connection; disconnect
+        // PeerManager rejected this connection; disconnect the TcpStream and
+        // don't even start the Reader and Writer.
+        descriptor.disconnect_socket();
         // In line with the requirements of new_inbound_connection() and
         // new_outbound_connection(), we do NOT call socket_disconnected() here.
-        descriptor.disconnect_socket();
         e
     })
 }
@@ -857,15 +864,240 @@ impl TcpDisconnectooor {
 
 #[cfg(test)]
 mod tests {
-    // use super::Connection;
-    use std::net::{TcpListener, TcpStream};
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use lightning::ln::features::*;
+    use lightning::ln::msgs::*;
+    use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, PeerManager};
+    use lightning::util::events::*;
+    use lightning::util::logger;
 
-    fn create_connection() -> (TcpStream, TcpStream) {
-        // We bind on localhost, hoping the environment is properly configured with a
-        // local address. This may not always be the case in containers and the
-        // like, so if this test is failing for you check that you have a
-        // loopback interface and it is configured with 127.0.0.1.
-        let (client, server) = if let Ok(server) = TcpListener::bind("127.0.0.1:9735") {
+    use super::ConnectionType::*;
+
+    use crossbeam::channel;
+
+    use std::mem;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    pub struct TestLogger();
+    impl logger::Logger for TestLogger {
+        fn log(&self, record: &logger::Record) {
+            println!(
+                "{:<5} [{} : {}, {}] {}",
+                record.level.to_string(),
+                record.module_path,
+                record.file,
+                record.line,
+                record.args
+            );
+        }
+    }
+
+    /// A RoutingMessageHandler that uses the peer_connected() and
+    /// peer_disconnected() callbacks to confirm that the peer was successfully
+    /// connected (and disconnected)
+    struct MsgHandler {
+        expected_pubkey: PublicKey,
+        connected_tx: channel::Sender<()>,
+        disconnected_tx: channel::Sender<()>,
+        disconnected_flag: AtomicBool,
+        msg_events: Mutex<Vec<MessageSendEvent>>,
+    }
+    impl RoutingMessageHandler for MsgHandler {
+        fn handle_node_announcement(
+            &self,
+            _msg: &NodeAnnouncement,
+        ) -> Result<bool, LightningError> {
+            Ok(false)
+        }
+        fn handle_channel_announcement(
+            &self,
+            _msg: &ChannelAnnouncement,
+        ) -> Result<bool, LightningError> {
+            Ok(false)
+        }
+        fn handle_channel_update(&self, _msg: &ChannelUpdate) -> Result<bool, LightningError> {
+            Ok(false)
+        }
+        fn get_next_channel_announcements(
+            &self,
+            _starting_point: u64,
+            _batch_amount: u8,
+        ) -> Vec<(
+            ChannelAnnouncement,
+            Option<ChannelUpdate>,
+            Option<ChannelUpdate>,
+        )> {
+            Vec::new()
+        }
+        fn get_next_node_announcements(
+            &self,
+            _starting_point: Option<&PublicKey>,
+            _batch_amount: u8,
+        ) -> Vec<NodeAnnouncement> {
+            Vec::new()
+        }
+        fn peer_connected(&self, _their_node_id: &PublicKey, _init_msg: &Init) {}
+        fn handle_reply_channel_range(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: ReplyChannelRange,
+        ) -> Result<(), LightningError> {
+            Ok(())
+        }
+        fn handle_reply_short_channel_ids_end(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: ReplyShortChannelIdsEnd,
+        ) -> Result<(), LightningError> {
+            Ok(())
+        }
+        fn handle_query_channel_range(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: QueryChannelRange,
+        ) -> Result<(), LightningError> {
+            Ok(())
+        }
+        fn handle_query_short_channel_ids(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: QueryShortChannelIds,
+        ) -> Result<(), LightningError> {
+            Ok(())
+        }
+    }
+    impl ChannelMessageHandler for MsgHandler {
+        fn handle_open_channel(
+            &self,
+            _their_node_id: &PublicKey,
+            _their_features: InitFeatures,
+            _msg: &OpenChannel,
+        ) {
+        }
+        fn handle_accept_channel(
+            &self,
+            _their_node_id: &PublicKey,
+            _their_features: InitFeatures,
+            _msg: &AcceptChannel,
+        ) {
+        }
+        fn handle_funding_created(&self, _their_node_id: &PublicKey, _msg: &FundingCreated) {}
+        fn handle_funding_signed(&self, _their_node_id: &PublicKey, _msg: &FundingSigned) {}
+        fn handle_funding_locked(&self, _their_node_id: &PublicKey, _msg: &FundingLocked) {}
+        fn handle_shutdown(
+            &self,
+            _their_node_id: &PublicKey,
+            _their_features: &InitFeatures,
+            _msg: &Shutdown,
+        ) {
+        }
+        fn handle_closing_signed(&self, _their_node_id: &PublicKey, _msg: &ClosingSigned) {}
+        fn handle_update_add_htlc(&self, _their_node_id: &PublicKey, _msg: &UpdateAddHTLC) {}
+        fn handle_update_fulfill_htlc(&self, _their_node_id: &PublicKey, _msg: &UpdateFulfillHTLC) {
+        }
+        fn handle_update_fail_htlc(&self, _their_node_id: &PublicKey, _msg: &UpdateFailHTLC) {}
+        fn handle_update_fail_malformed_htlc(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: &UpdateFailMalformedHTLC,
+        ) {
+        }
+        fn handle_commitment_signed(&self, _their_node_id: &PublicKey, _msg: &CommitmentSigned) {}
+        fn handle_revoke_and_ack(&self, _their_node_id: &PublicKey, _msg: &RevokeAndACK) {}
+        fn handle_update_fee(&self, _their_node_id: &PublicKey, _msg: &UpdateFee) {}
+        fn handle_announcement_signatures(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: &AnnouncementSignatures,
+        ) {
+        }
+        fn handle_channel_update(&self, _their_node_id: &PublicKey, _msg: &ChannelUpdate) {}
+        fn peer_disconnected(&self, their_node_id: &PublicKey, _no_connection_possible: bool) {
+            if *their_node_id == self.expected_pubkey {
+                self.disconnected_flag.store(true, Ordering::SeqCst);
+                self.disconnected_tx.try_send(()).unwrap();
+            }
+        }
+        fn peer_connected(&self, their_node_id: &PublicKey, _msg: &Init) {
+            if *their_node_id == self.expected_pubkey {
+                self.connected_tx.try_send(()).unwrap();
+            }
+        }
+        fn handle_channel_reestablish(
+            &self,
+            _their_node_id: &PublicKey,
+            _msg: &ChannelReestablish,
+        ) {
+        }
+        fn handle_error(&self, _their_node_id: &PublicKey, _msg: &ErrorMessage) {}
+    }
+    impl MessageSendEventsProvider for MsgHandler {
+        fn get_and_clear_pending_msg_events(&self) -> Vec<MessageSendEvent> {
+            let mut ret = Vec::new();
+            mem::swap(&mut *self.msg_events.lock().unwrap(), &mut ret);
+            ret
+        }
+    }
+
+    #[test]
+    fn basic_connection_test() {
+        // Initialize public / private keys
+        let secp_ctx = Secp256k1::new();
+        let a_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let b_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let a_pub = PublicKey::from_secret_key(&secp_ctx, &a_key);
+        let b_pub = PublicKey::from_secret_key(&secp_ctx, &b_key);
+
+        // Initialize node A
+        let (a_connected_tx, a_connected_rx) = channel::bounded(1);
+        let (a_disconnected_tx, a_disconnected_rx) = channel::bounded(1);
+        let a_handler = Arc::new(MsgHandler {
+            expected_pubkey: b_pub,
+            connected_tx: a_connected_tx,
+            disconnected_tx: a_disconnected_tx,
+            disconnected_flag: AtomicBool::new(false),
+            msg_events: Mutex::new(Vec::new()),
+        });
+        let a_manager = Arc::new(PeerManager::new(
+            MessageHandler {
+                chan_handler: Arc::clone(&a_handler),
+                route_handler: Arc::clone(&a_handler),
+            },
+            a_key.clone(),
+            &[1; 32],
+            Arc::new(TestLogger()),
+            Arc::new(IgnoringMessageHandler {}),
+        ));
+
+        // Initialize node B
+        let (b_connected_tx, b_connected_rx) = channel::bounded(1);
+        let (b_disconnected_tx, b_disconnected_rx) = channel::bounded(1);
+        let b_handler = Arc::new(MsgHandler {
+            expected_pubkey: a_pub,
+            connected_tx: b_connected_tx,
+            disconnected_tx: b_disconnected_tx,
+            disconnected_flag: AtomicBool::new(false),
+            msg_events: Mutex::new(Vec::new()),
+        });
+        let b_manager = Arc::new(PeerManager::new(
+            MessageHandler {
+                chan_handler: Arc::clone(&b_handler),
+                route_handler: Arc::clone(&b_handler),
+            },
+            b_key.clone(),
+            &[2; 32],
+            Arc::new(TestLogger()),
+            Arc::new(IgnoringMessageHandler {}),
+        ));
+
+        // Create a connection. We bind on localhost, hoping the environment is
+        // properly configured with a local address. This may not always be the
+        // case in containers and the like, so if this test is failing for you
+        // check that you have a loopback interface and it is configured with
+        // 127.0.0.1.
+        let (conn_a, conn_b) = if let Ok(server) = TcpListener::bind("127.0.0.1:9735") {
             (
                 TcpStream::connect("127.0.0.1:9735").unwrap(),
                 server.accept().unwrap().0,
@@ -884,20 +1116,31 @@ mod tests {
             panic!("Failed to bind to v4 localhost on common ports");
         };
 
-        (client, server)
-    }
+        // Initiate the connection handler threads for node A and B
+        super::handle_connection(Arc::clone(&a_manager), conn_a, Outbound(b_pub)).unwrap();
+        super::handle_connection(b_manager, conn_b, Inbound).unwrap();
 
-    #[test]
-    fn basic_test() {
-        let (_client, _server) = create_connection();
-        // let _client_conn = Connection::init(client);
+        // Confirm that each of the node's MsgHandlers accepted the connection
+        a_connected_rx.recv().unwrap();
+        b_connected_rx.recv().unwrap();
 
-        // client_conn.reader.write();
-        // client_conn.reader.0.write();
-    }
+        // Trigger a disconnect
+        a_handler
+            .msg_events
+            .lock()
+            .unwrap()
+            .push(MessageSendEvent::HandleError {
+                node_id: b_pub,
+                action: ErrorAction::DisconnectPeer { msg: None },
+            });
+        assert!(!a_handler.disconnected_flag.load(Ordering::SeqCst));
+        assert!(!b_handler.disconnected_flag.load(Ordering::SeqCst));
+        a_manager.process_events();
 
-    #[test]
-    fn connect_to_stream() {
-        assert!(true);
+        // Confirm recognition of disconnect
+        a_disconnected_rx.recv().unwrap();
+        b_disconnected_rx.recv().unwrap();
+        assert!(a_handler.disconnected_flag.load(Ordering::SeqCst));
+        assert!(b_handler.disconnected_flag.load(Ordering::SeqCst));
     }
 }
