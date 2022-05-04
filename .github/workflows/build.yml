@@ -10,7 +10,7 @@ jobs:
         platform: [ ubuntu-latest ]
         toolchain: [ stable,
                      beta,
-                     # 1.41.1 is MSRV for Rust-Lightning, lightning-invoice, and lightning-persister
+                     # 1.41.1 is MSRV for Rust-Lightning, lightning-invoice, lightning-persister, and lightning-net
                      1.41.1,
                      # 1.45.2 is MSRV for lightning-net-tokio, lightning-block-sync, and coverage generation
                      1.45.2,
