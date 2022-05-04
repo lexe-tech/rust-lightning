@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use bitcoin::secp256k1::key::PublicKey;
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
@@ -276,9 +276,9 @@ fn init_channels() -> (
     Sender<WriterCommand>,
     Receiver<WriterCommand>,
 ) {
-    let (reader_cmd_tx, reader_cmd_rx) = crossbeam::channel::unbounded();
+    let (reader_cmd_tx, reader_cmd_rx) = crossbeam_channel::unbounded();
 
-    let (writer_cmd_tx, writer_cmd_rx) = crossbeam::channel::bounded(2);
+    let (writer_cmd_tx, writer_cmd_rx) = crossbeam_channel::bounded(2);
 
     (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx)
 }
@@ -873,8 +873,6 @@ mod tests {
 
     use super::ConnectionType::*;
 
-    use crossbeam::channel;
-
     use std::mem;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -899,8 +897,8 @@ mod tests {
     /// connected (and disconnected)
     struct MsgHandler {
         expected_pubkey: PublicKey,
-        connected_tx: channel::Sender<()>,
-        disconnected_tx: channel::Sender<()>,
+        connected_tx: crossbeam_channel::Sender<()>,
+        disconnected_tx: crossbeam_channel::Sender<()>,
         disconnected_flag: AtomicBool,
         msg_events: Mutex<Vec<MessageSendEvent>>,
     }
@@ -1051,8 +1049,8 @@ mod tests {
         let b_pub = PublicKey::from_secret_key(&secp_ctx, &b_key);
 
         // Initialize node A
-        let (a_connected_tx, a_connected_rx) = channel::bounded(1);
-        let (a_disconnected_tx, a_disconnected_rx) = channel::bounded(1);
+        let (a_connected_tx, a_connected_rx) = crossbeam_channel::bounded(1);
+        let (a_disconnected_tx, a_disconnected_rx) = crossbeam_channel::bounded(1);
         let a_handler = Arc::new(MsgHandler {
             expected_pubkey: b_pub,
             connected_tx: a_connected_tx,
@@ -1072,8 +1070,8 @@ mod tests {
         ));
 
         // Initialize node B
-        let (b_connected_tx, b_connected_rx) = channel::bounded(1);
-        let (b_disconnected_tx, b_disconnected_rx) = channel::bounded(1);
+        let (b_connected_tx, b_connected_rx) = crossbeam_channel::bounded(1);
+        let (b_disconnected_tx, b_disconnected_rx) = crossbeam_channel::bounded(1);
         let b_handler = Arc::new(MsgHandler {
             expected_pubkey: a_pub,
             connected_tx: b_connected_tx,

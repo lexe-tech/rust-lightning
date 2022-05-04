@@ -1,7 +1,7 @@
 [package]
 name = "lightning-net"
 version = "0.0.106"
-authors = ["Matt Corallo"]
+authors = ["Max Fang <protonmail.com@maxfa.ng>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lightningdevkit/rust-lightning/"
 description = """
@@ -17,6 +17,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-bitcoin = "0.27"
+bitcoin = { version = "0.27", default-features = false }
 lightning = { version = "0.0.106", path = "../lightning" }
-crossbeam = "0.8.1"
+crossbeam-channel = "0.5.4"
