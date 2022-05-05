@@ -492,17 +492,14 @@ where
     ///   read events accordingly.
     /// - In between each event, do a non-blocking check for `ReaderCommand`s.
     fn run(&mut self) {
-        use std::io::ErrorKind::*;
-
         // 8KB is nice and big but also should never cause any issues with stack
         // overflowing.
         let mut buf = [0; 8192];
 
         loop {
             // Every time this line is reached, read_paused == false.
-            // Do a non-blocking try_recv() to see if we've been asked to pause reads
-            let shutdown = self.handle_command(false);
-            if shutdown {
+            // Do a non-blocking try_recv() to check for commands
+            if self.do_try_recv() {
                 break;
             }
 
@@ -510,55 +507,13 @@ where
                 // To avoid a busy loop while reading is paused, block on the
                 // reader_cmd channel until we are told to resume reading again
                 // or until we receive a shut down command.
-                let shutdown = self.handle_command(true);
-                if shutdown {
+                if self.do_recv() {
                     break;
                 }
             } else {
                 // Reading is not paused; block on the next read.
-                // If the SyncSocketDescriptor disconnects the underlying TcpStream,
-                // the Reader will read Ok(0), in which case we know to break
-                // the loop and shut down.
-                match self.inner.read(&mut buf) {
-                    Ok(0) => {
-                        // Peer disconnected. Notify the PeerManager then break
-                        self.peer_manager.socket_disconnected(&self.descriptor);
-                        self.peer_manager.process_events();
-                        break;
-                    }
-                    Ok(bytes_read) => {
-                        // Register the read event with the PeerManager
-                        match self
-                            .peer_manager
-                            .read_event(&mut self.descriptor, &buf[0..bytes_read])
-                        {
-                            Ok(pause_read) => {
-                                if pause_read {
-                                    self.read_paused = true;
-                                }
-                            }
-                            Err(_) => {
-                                // Rust-Lightning told us to disconnect; do it
-                                // No need to notify PeerManager in this case
-                                break;
-                            }
-                        }
-
-                        // As noted in the read_event() docs, call process_events().
-                        self.peer_manager.process_events()
-                    }
-                    Err(e) => match e.kind() {
-                        TimedOut | Interrupted => {
-                            // Retry
-                        }
-                        _ => {
-                            // For all other errors, notify the
-                            // PeerManager, break, and shut down
-                            self.peer_manager.socket_disconnected(&self.descriptor);
-                            self.peer_manager.process_events();
-                            break;
-                        }
-                    },
+                if self.do_read(&mut buf) {
+                    break;
                 }
             }
         }
@@ -572,43 +527,101 @@ where
             .try_send(WriterCommand::Shutdown);
     }
 
-    /// Handles a potential ReaderCommand in a blocking or non-blocking manner.
-    /// Returns a bool representing whether the Reader should break the event
-    /// loop and shut down.
-    fn handle_command(&mut self, block: bool) -> bool {
-        if block {
-            match self.reader_cmd_rx.recv() {
-                Ok(cmd) => match cmd {
-                    ReaderCommand::PauseRead => {
-                        self.read_paused = true;
-                    }
-                    ReaderCommand::ResumeRead => {
-                        self.read_paused = false;
-                    }
-                    ReaderCommand::Shutdown => return true,
-                },
-                Err(_) => {
-                    // The channel is disconnected, break and shut down
-                    return true;
+    /// Checks for a command in a non-blocking manner, handling the command
+    /// accordingly if there was one.
+    ///
+    /// Returns a bool indicating whether the Reader should shut down.
+    fn do_try_recv(&mut self) -> bool {
+        match self.reader_cmd_rx.try_recv() {
+            Ok(cmd) => match cmd {
+                ReaderCommand::PauseRead => {
+                    self.read_paused = true;
                 }
-            }
-        } else {
-            match self.reader_cmd_rx.try_recv() {
-                Ok(cmd) => match cmd {
-                    ReaderCommand::PauseRead => {
-                        self.read_paused = true;
-                    }
-                    ReaderCommand::ResumeRead => {
-                        self.read_paused = false;
-                    }
-                    ReaderCommand::Shutdown => return true,
-                },
-                Err(e) => match e {
-                    TryRecvError::Empty => {}
-                    TryRecvError::Disconnected => return true,
-                },
+                ReaderCommand::ResumeRead => {
+                    self.read_paused = false;
+                }
+                ReaderCommand::Shutdown => return true,
+            },
+            Err(e) => match e {
+                TryRecvError::Empty => {}
+                TryRecvError::Disconnected => return true,
+            },
+        }
+
+        false
+    }
+
+    /// Blocks on the command channel and handles the command accordingly.
+    ///
+    /// Returns a bool indicating whether the Reader should shut down.
+    fn do_recv(&mut self) -> bool {
+        match self.reader_cmd_rx.recv() {
+            Ok(cmd) => match cmd {
+                ReaderCommand::PauseRead => {
+                    self.read_paused = true;
+                }
+                ReaderCommand::ResumeRead => {
+                    self.read_paused = false;
+                }
+                ReaderCommand::Shutdown => return true,
+            },
+            Err(_) => {
+                // The channel is disconnected, break and shut down
+                return true;
             }
         }
+
+        false
+    }
+
+    /// Blocks on read() and handles the response accordingly.
+    ///
+    /// Returns a bool indicating whether the Reader should shut down.
+    fn do_read(&mut self, buf: &mut [u8; 8192]) -> bool {
+        use std::io::ErrorKind::*;
+
+        match self.inner.read(buf) {
+            Ok(0) => {
+                // Peer disconnected or TcpStream::shutdown was called.
+                // Notify the PeerManager then shutdown
+                self.peer_manager.socket_disconnected(&self.descriptor);
+                self.peer_manager.process_events();
+                return true;
+            }
+            Ok(bytes_read) => {
+                // Register the read event with the PeerManager
+                match self
+                    .peer_manager
+                    .read_event(&mut self.descriptor, &buf[0..bytes_read])
+                {
+                    Ok(pause_read) => {
+                        if pause_read {
+                            self.read_paused = true;
+                        }
+                    }
+                    Err(_) => {
+                        // Rust-Lightning told us to disconnect; do it
+                        // No need to notify PeerManager in this case
+                        return true;
+                    }
+                }
+
+                // As noted in the read_event() docs, call process_events().
+                self.peer_manager.process_events()
+            }
+            Err(e) => match e.kind() {
+                TimedOut | Interrupted => {
+                    // Retry
+                }
+                _ => {
+                    // For all other errors, notify PeerManager and shut down
+                    self.peer_manager.socket_disconnected(&self.descriptor);
+                    self.peer_manager.process_events();
+                    return true;
+                }
+            },
+        }
+
         false
     }
 }
