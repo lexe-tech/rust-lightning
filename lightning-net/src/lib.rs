@@ -59,7 +59,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
@@ -84,7 +84,7 @@ pub fn initiate_outbound<CMH, RMH, L, UMH>(
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     their_node_id: PublicKey,
     addr: SocketAddr,
-) -> Result<Result<(), PeerHandleError>, std::io::Error>
+) -> Result<Result<(JoinHandle<()>, JoinHandle<()>), PeerHandleError>, std::io::Error>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
     RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -100,7 +100,13 @@ where
     })
 }
 
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Get a fresh ID to represent a new connection
+///
+/// This function hides the global so that it's only accessible via this fn.
+fn next_connection_id() -> u64 {
+    static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Whether the new connection was initiated by the peer (inbound) or initiated
 /// by us (outbound). If the new connection was outbound, the public key
@@ -117,11 +123,13 @@ pub enum ConnectionType {
 /// manage the connection.
 ///
 /// Returns a Result indicating whether the PeerManager accepted the connection.
+/// If Ok, additionally returns the handles to the underlying Reader and Writer
+/// threads which can optionally be join()ed on
 pub fn handle_connection<CMH, RMH, L, UMH>(
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     stream: TcpStream,
     conn_type: ConnectionType,
-) -> Result<(), PeerHandleError>
+) -> Result<(JoinHandle<()>, JoinHandle<()>), PeerHandleError>
 where
     CMH: ChannelMessageHandler + 'static + Send + Sync,
     RMH: RoutingMessageHandler + 'static + Send + Sync,
@@ -132,7 +140,7 @@ where
     let (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx) = init_channels();
 
     // Generate a new ID that represents this connection
-    let conn_id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
+    let conn_id = next_connection_id();
     let socket_addr = stream.peer_addr().unwrap();
 
     // Init TcpReader, TcpWriter, TcpDisconnectooor
@@ -196,8 +204,9 @@ where
     .map(|()| {
         // PeerManager accepted the connection; kick off processing by spawning
         // the Reader / Writer threads.
-        thread::spawn(move || reader.run());
-        thread::spawn(move || writer.run());
+        let reader_handle = thread::spawn(move || reader.run());
+        let writer_handle = thread::spawn(move || writer.run());
+        (reader_handle, writer_handle)
     })
     .map_err(|e| {
         // PeerManager rejected this connection; disconnect the TcpStream and
@@ -251,11 +260,6 @@ enum WriterCommand {
 ///   be pushed into the channel at any time, but to ensure that there is always
 ///   space for it, send_data() will only ever push a WriteData command into the
 ///   channel after it first detects that the channel is completely empty.
-/// - The reason we can't have a second dedicated channel for sending Shutdown
-///   commands to the Writer is that, being in a synchronous context, the Writer
-///   can only block on one channel at once, which means that in the case of two
-///   channels it could wait for WriteData commands or Shutdown commands, but
-///   not both.
 /// - Allocating only one slot in the channel for WriteData commands allows
 ///   send_data() to quickly detect that writes are still processing. This space
 ///   can be thought of as a second buffer, where the first buffer is the Writer
@@ -869,6 +873,7 @@ mod tests {
     use lightning::util::events::*;
     use lightning::util::logger;
 
+    use super::handle_connection;
     use super::ConnectionType::*;
 
     use std::mem;
@@ -1113,8 +1118,9 @@ mod tests {
         };
 
         // Initiate the connection handler threads for node A and B
-        super::handle_connection(Arc::clone(&a_manager), conn_a, Outbound(b_pub)).unwrap();
-        super::handle_connection(b_manager, conn_b, Inbound).unwrap();
+        let (a_read, a_write) =
+            handle_connection(Arc::clone(&a_manager), conn_a, Outbound(b_pub)).unwrap();
+        let (b_read, b_write) = handle_connection(b_manager, conn_b, Inbound).unwrap();
 
         // Confirm that each of the node's MsgHandlers accepted the connection
         a_connected_rx.recv().unwrap();
@@ -1138,5 +1144,11 @@ mod tests {
         b_disconnected_rx.recv().unwrap();
         assert!(a_handler.disconnected_flag.load(Ordering::SeqCst));
         assert!(b_handler.disconnected_flag.load(Ordering::SeqCst));
+
+        // Confirm read and Writer threads finished for both nodes
+        a_read.join().unwrap();
+        a_write.join().unwrap();
+        b_read.join().unwrap();
+        b_write.join().unwrap();
     }
 }
