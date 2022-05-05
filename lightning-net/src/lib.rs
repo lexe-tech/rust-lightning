@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{select, Receiver, Sender, TryRecvError, TrySendError};
 
 use bitcoin::secp256k1::key::PublicKey;
 use lightning::ln::msgs::{ChannelMessageHandler, NetAddress, RoutingMessageHandler};
@@ -137,7 +137,8 @@ where
     UMH: CustomMessageHandler + 'static + Send + Sync,
 {
     // Init channels
-    let (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx) = init_channels();
+    let (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx, write_data_tx, write_data_rx) =
+        init_channels();
 
     // Generate a new ID that represents this connection
     let conn_id = next_connection_id();
@@ -151,8 +152,13 @@ where
     let tcp_disconnector = TcpDisconnectooor(disconnector_stream);
 
     // Init SyncSocketDescriptor
-    let mut descriptor =
-        SyncSocketDescriptor::new(conn_id, tcp_disconnector, reader_cmd_tx, writer_cmd_tx);
+    let mut descriptor = SyncSocketDescriptor::new(
+        conn_id,
+        tcp_disconnector,
+        reader_cmd_tx,
+        writer_cmd_tx,
+        write_data_tx,
+    );
 
     // Init Reader and Writer
     let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
@@ -166,6 +172,7 @@ where
         peer_manager.clone(),
         descriptor.clone(),
         writer_cmd_rx,
+        write_data_rx,
     );
 
     // Notify the PeerManager of the new connection depending on its ConnectionType.
@@ -186,10 +193,10 @@ where
                 // initial WriteData WriterCommand.
                 let bytes_pushed = descriptor.send_data(&initial_data, true);
                 // This should always succeed since send_data just pushes data
-                // into the writer_cmd channel and the writer_cmd channel always
-                // starts out completely empty. If pushing the initial 10s of
-                // bytes into the writer_cmd channel fails, something is very
-                // wrong; probably a programmer error.
+                // into the write_data channel, which always starts out
+                // completely empty. If pushing the initial 10s of bytes into
+                // the channel fails, something is very wrong; probably a
+                // programmer error.
                 if bytes_pushed != initial_data.len() {
                     panic!("The initial write should always succeed");
                 }
@@ -236,29 +243,17 @@ enum ReaderCommand {
 
 /// Commands that can be sent to the Writer.
 enum WriterCommand {
-    WriteData(Vec<u8>),
     Shutdown,
 }
 
-/// Initializes the crossbeam channels for sending `ReaderCommand`s and
-/// `WriterCommand`s.
+/// Initializes the crossbeam channels required for a connection.
 ///
-/// The `ReaderCommand` channel is unbounded, and can be used to tell the
-/// `Reader` to resume reads, pause reads, or shut down.
-///
-/// The `WriterCommand` channel has a capacity of 2, and can be used to tell the
-/// `Writer` to write a Vec<u8> of data, or shut down.
-///
-/// - The WriterCommand channel is size 2 so as to have 1 dedicated space for
-///   each type of WriterCommand: WriteData and Shutdown. A Shutdown command can
-///   be pushed into the channel at any time, but to ensure that there is always
-///   space for it, send_data() will only ever push a WriteData command into the
-///   channel after it first detects that the channel is completely empty.
-/// - Allocating only one slot in the channel for WriteData commands allows
-///   send_data() to quickly detect that writes are still processing. This space
-///   can be thought of as a second buffer, where the first buffer is the Writer
-///   internal buffer (`self.buf`) and the third buffer is the &[u8] passed into
-///   send_data().
+/// - The `reader_cmd` channel is unbounded, and can be used to tell the
+///   `Reader` to resume reads, pause reads, or shut down.
+/// - The `writer_cmd` channel is unbounded, and can be used to tell the
+///   `Writer` to shut down.
+/// - The `write_data` channel has a capacity of 1, and can be used to request a
+///   write of a Vec<u8> of data.
 ///
 /// Finally:
 ///
@@ -271,30 +266,27 @@ fn init_channels() -> (
     Receiver<ReaderCommand>,
     Sender<WriterCommand>,
     Receiver<WriterCommand>,
+    Sender<Vec<u8>>,
+    Receiver<Vec<u8>>,
 ) {
     let (reader_cmd_tx, reader_cmd_rx) = crossbeam_channel::unbounded();
+    let (writer_cmd_tx, writer_cmd_rx) = crossbeam_channel::unbounded();
+    let (write_data_tx, write_data_rx) = crossbeam_channel::bounded(1);
 
-    let (writer_cmd_tx, writer_cmd_rx) = crossbeam_channel::bounded(2);
-
-    (reader_cmd_tx, reader_cmd_rx, writer_cmd_tx, writer_cmd_rx)
+    (
+        reader_cmd_tx,
+        reader_cmd_rx,
+        writer_cmd_tx,
+        writer_cmd_rx,
+        write_data_tx,
+        write_data_rx,
+    )
 }
 
-/// A concrete implementation of the SocketDescriptor.
+/// A concrete implementation of the SocketDescriptor trait.
 ///
 /// A SyncSocketDescriptor is essentially a `clone()`able handle to an
 /// underlying connection as well as an identifier for that connection.
-///
-/// It consists of an ID representing the unique connection to the peer,
-/// crossbeam channel `Sender`s for the `Reader` and `Writer`, and a
-/// `TcpDisconnectooor` that can be used to shut down the underlying `TcpStream`
-/// in the event that both the `Reader` and the `Writer` are blocked on
-/// `recv()`ing from their crossbeam channels.
-///
-/// A `SyncSocketDescriptor` allows a `PeerManager` to manage a connection via
-/// its calls to `send_data()` and `disconnect_socket()`. Furthermore,
-/// the `Reader` and `Writer` each hold a copy to pass along with their
-/// calls into the `PeerManager`, so that the `PeerManager` can identify which
-/// connection is currently being processed during calls into the `PeerManager`.
 ///
 /// This type is public only because handle_connection() requires it to be.
 #[derive(Clone)]
@@ -303,6 +295,7 @@ pub struct SyncSocketDescriptor {
     tcp_disconnector: TcpDisconnectooor,
     reader_cmd_tx: Sender<ReaderCommand>,
     writer_cmd_tx: Sender<WriterCommand>,
+    write_data_tx: Sender<Vec<u8>>,
 }
 impl PartialEq for SyncSocketDescriptor {
     fn eq(&self, other: &Self) -> bool {
@@ -321,19 +314,21 @@ impl SyncSocketDescriptor {
         tcp_disconnector: TcpDisconnectooor,
         reader_cmd_tx: Sender<ReaderCommand>,
         writer_cmd_tx: Sender<WriterCommand>,
+        write_data_tx: Sender<Vec<u8>>,
     ) -> Self {
         Self {
             id: connection_id,
             tcp_disconnector,
             reader_cmd_tx,
             writer_cmd_tx,
+            write_data_tx,
         }
     }
 }
 impl SocketDescriptor for SyncSocketDescriptor {
     /// Attempts to queue up some data from the given slice for the `Writer` to
     /// send. Returns the number of bytes that were successfully pushed to the
-    /// `WriterCommand` channel.
+    /// `write_data` channel.
     ///
     /// This implementation never calls back into the PeerManager directly,
     /// thereby preventing reentrancy / deadlock issues. Instead, any commands
@@ -346,7 +341,6 @@ impl SocketDescriptor for SyncSocketDescriptor {
     /// amount of time that the PeerManager's internal locks are held.
     fn send_data(&mut self, data: &[u8], resume_read: bool) -> usize {
         if resume_read {
-            // It doesn't matter whether the channel send is Ok or Err
             let _ = self.reader_cmd_tx.try_send(ReaderCommand::ResumeRead);
         }
 
@@ -354,21 +348,15 @@ impl SocketDescriptor for SyncSocketDescriptor {
             return 0;
         }
 
-        // To ensure that there is always space for a Shutdown command, only
-        // push data into the writer_cmd channel if it is currently empty.
-        if self.writer_cmd_tx.is_empty() {
+        if self.write_data_tx.is_empty() {
             // The data must be copied into the channel since a &[u8] reference
             // cannot be sent across threads. This incurs a small amount of overhead.
-            let cmd = WriterCommand::WriteData(data.to_vec());
-            match self.writer_cmd_tx.try_send(cmd) {
-                Ok(()) => {
-                    // Data was successfully sent to the Writer.
-                    data.len()
-                }
+            match self.write_data_tx.try_send(data.to_vec()) {
+                Ok(()) => data.len(),
                 Err(e) => match e {
                     TrySendError::Full(_) => {
-                        // This could only happen if both channel slots were
-                        // consumed in between the if check above and now - a
+                        // This could only happen if another Sender pushed into
+                        // the channel in between the if check above and now - a
                         // TOCTTOU error. This really shouldn't happen, but
                         // let's just proceed normally: pause reads and return 0
                         let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
@@ -382,8 +370,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
                 },
             }
         } else {
-            // There wasn't enough space in the channel to hold the data AND
-            // leave an empty space for a potential Shutdown command. Pause.
+            // Writes are processing; pause reads.
             let _ = self.reader_cmd_tx.try_send(ReaderCommand::PauseRead);
             0
         }
@@ -406,7 +393,7 @@ impl SocketDescriptor for SyncSocketDescriptor {
     /// the trigger:
     /// - (1) and (2): If the Reader received the trigger, it will shut down
     ///   BOTH halves of the shared TcpStream AND send a Shutdown command to the
-    ///   Reader.
+    ///   Writer.
     ///
     ///   - The explicit Shutdown command from the Reader is necessary because
     ///     if the Reader is blocked on `writer_cmd_rx.recv()` due to its
@@ -639,6 +626,7 @@ where
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     descriptor: SyncSocketDescriptor,
     writer_cmd_rx: Receiver<WriterCommand>,
+    write_data_rx: Receiver<Vec<u8>>,
     /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
     ///
@@ -672,39 +660,44 @@ where
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         descriptor: SyncSocketDescriptor,
         writer_cmd_rx: Receiver<WriterCommand>,
+        write_data_rx: Receiver<Vec<u8>>,
     ) -> Self {
         Self {
             inner: writer,
             peer_manager,
             descriptor,
             writer_cmd_rx,
+            write_data_rx,
             buf: None,
             start: 0,
         }
     }
 
-    /// Process `WriteData` requests, or wait for the next `WriterCommand` if
-    /// the internal buffer is empty. This implementation avoids busy loops and
-    /// lets the thread go to sleep whenever writes or channel commands are
-    /// pending.
+    /// Process `write_data` requests, or block on the `writer_cmd` and
+    /// `write_data` channels if the internal buffer is empty. This
+    /// implementation avoids busy loops and lets the thread go to sleep
+    /// whenever writes or channel messages are pending.
     ///
     /// - If `self.buf == None`, block on `self.reader_cmd_rx.recv()` and handle
     ///   any commands accordingly.
     /// - If `self.buf == Some(Vec<u8>)`, block on `self.inner.write()` and
     ///   handle the response accordingly.
-    /// - The Writer does NOT check for pending `WriterCommands` in between each
-    ///   event. This is because we do NOT want to take a potential WriteData
-    ///   request out of the channel in the case that the Writer is currently
-    ///   failing to write the data in self.buf(). This way, a failing write
-    ///   will cause the next send_data() call to fill up the space dedicated
-    ///   for WriteData commands, which in turn allows a later call to
-    ///   send_data() to detect that writes are still pending.
+    /// - In between each event, do a non-blocking check for Shutdown commands.
     #[allow(clippy::single_match)]
     #[allow(clippy::comparison_chain)]
     fn run(&mut self) {
         use std::io::ErrorKind::*;
 
         loop {
+            // Do a non-blocking check to see if we've been told to shut down
+            match self.writer_cmd_rx.try_recv() {
+                Ok(WriterCommand::Shutdown) => break,
+                Err(e) => match e {
+                    TryRecvError::Empty => {}
+                    TryRecvError::Disconnected => break,
+                },
+            }
+
             match &self.buf {
                 Some(buf) => {
                     // We have data in our internal buffer; attempt to write it
@@ -755,39 +748,29 @@ where
                         },
                     }
                 }
-                None => {
-                    // We don't have data in our internal buffer; block on the
-                    // command channel
-                    match self.writer_cmd_rx.recv() {
-                        Ok(cmd) => match cmd {
-                            WriterCommand::WriteData(data) => {
-                                if !data.is_empty() {
-                                    // Data fetched, add it to the buffer
-                                    self.buf = Some(data);
-                                    self.start = 0;
-                                }
-
-                                // There is space for the next send_data()
-                                // request; notify the PeerManager
-                                if self
-                                    .peer_manager
-                                    .write_buffer_space_avail(&mut self.descriptor)
-                                    .is_err()
-                                {
-                                    // PeerManager wants us to disconnect
-                                    break;
-                                }
+                None => select! {
+                    recv(self.writer_cmd_rx) -> _ => break,
+                    recv(self.write_data_rx) -> res => match res {
+                        Ok(data) => {
+                            if !data.is_empty() {
+                                self.buf = Some(data);
+                                self.start = 0;
                             }
-                            WriterCommand::Shutdown => break,
-                        },
-                        Err(_) => {
-                            // Channel is empty and disconnected
-                            // => no more messages can be sent
-                            // => break the loop and shut down
-                            break;
+
+                            // There is space for the next send_data()
+                            // request; notify the PeerManager
+                            if self
+                                .peer_manager
+                                .write_buffer_space_avail(&mut self.descriptor)
+                                .is_err()
+                            {
+                                // PeerManager wants us to disconnect
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                }
+                },
             }
         }
 
