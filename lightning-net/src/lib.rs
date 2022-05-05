@@ -151,12 +151,8 @@ where
     let tcp_disconnector = TcpDisconnectooor(disconnector_stream);
 
     // Init SyncSocketDescriptor
-    let mut descriptor = SyncSocketDescriptor::new(
-        conn_id,
-        tcp_disconnector,
-        reader_cmd_tx.clone(),
-        writer_cmd_tx.clone(),
-    );
+    let mut descriptor =
+        SyncSocketDescriptor::new(conn_id, tcp_disconnector, reader_cmd_tx, writer_cmd_tx);
 
     // Init Reader and Writer
     let mut reader: Reader<CMH, RMH, L, UMH> = Reader::new(
@@ -164,13 +160,11 @@ where
         peer_manager.clone(),
         descriptor.clone(),
         reader_cmd_rx,
-        writer_cmd_tx,
     );
     let mut writer: Writer<CMH, RMH, L, UMH> = Writer::new(
         tcp_writer,
         peer_manager.clone(),
         descriptor.clone(),
-        reader_cmd_tx,
         writer_cmd_rx,
     );
 
@@ -270,8 +264,8 @@ enum WriterCommand {
 ///
 /// - A `SyncSocketDescriptor` holds a `Sender` for both the `ReaderCommand` and
 ///   `WriterCommand` channels.
-/// - A `Reader` holds a `Sender` for the `WriterCommand` channel, and a
-///   `Writer` holds a `Sender` for the `ReaderCommand` channel.
+/// - The `Reader` can send commands to the `Writer` and vice versa because the
+///   `Reader` and `Writer` both hold a `SyncSocketDescriptor` clone.
 fn init_channels() -> (
     Sender<ReaderCommand>,
     Receiver<ReaderCommand>,
@@ -464,7 +458,6 @@ where
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     descriptor: SyncSocketDescriptor,
     reader_cmd_rx: Receiver<ReaderCommand>,
-    writer_cmd_tx: Sender<WriterCommand>,
     read_paused: bool,
 }
 impl<CMH, RMH, L, UMH> Reader<CMH, RMH, L, UMH>
@@ -479,14 +472,12 @@ where
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         descriptor: SyncSocketDescriptor,
         reader_cmd_rx: Receiver<ReaderCommand>,
-        writer_cmd_tx: Sender<WriterCommand>,
     ) -> Self {
         Self {
             inner: reader,
             peer_manager,
             descriptor,
             reader_cmd_rx,
-            writer_cmd_tx,
             read_paused: false,
         }
     }
@@ -575,7 +566,10 @@ where
         // Shut down the underlying stream. It's fine if it was already closed.
         let _ = self.inner.shutdown();
         // Send a signal to the Writer to do the same.
-        let _ = self.writer_cmd_tx.try_send(WriterCommand::Shutdown);
+        let _ = self
+            .descriptor
+            .writer_cmd_tx
+            .try_send(WriterCommand::Shutdown);
     }
 
     /// Handles a potential ReaderCommand in a blocking or non-blocking manner.
@@ -631,7 +625,6 @@ where
     inner: TcpWriter,
     peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
     descriptor: SyncSocketDescriptor,
-    reader_cmd_tx: Sender<ReaderCommand>,
     writer_cmd_rx: Receiver<WriterCommand>,
     /// An internal buffer which stores the data that the Writer is
     /// currently attempting to write.
@@ -665,14 +658,12 @@ where
         writer: TcpWriter,
         peer_manager: Arc<PeerManager<SyncSocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>,
         descriptor: SyncSocketDescriptor,
-        reader_cmd_tx: Sender<ReaderCommand>,
         writer_cmd_rx: Receiver<WriterCommand>,
     ) -> Self {
         Self {
             inner: writer,
             peer_manager,
             descriptor,
-            reader_cmd_tx,
             writer_cmd_rx,
             buf: None,
             start: 0,
@@ -790,7 +781,10 @@ where
         // Shut down the underlying stream. It's fine if it was already closed.
         let _ = self.inner.shutdown();
         // Send a signal to the Reader to do the same.
-        let _ = self.reader_cmd_tx.try_send(ReaderCommand::Shutdown);
+        let _ = self
+            .descriptor
+            .reader_cmd_tx
+            .try_send(ReaderCommand::Shutdown);
     }
 }
 
