@@ -35,16 +35,6 @@
 //! - `std::thread::sleep_ms`
 //! - `std::thread::park_timeout`
 //! - `std::thread::park_timeout_ms`
-//! - `std::net::TcpStream::shutdown`
-//! - `std::net::TcpStream::connect_timeout`
-//! - `std::net::TcpStream::set_read_timeout`
-//! - `std::net::TcpStream::set_write_timeout`
-//! - `std::net::TcpStream::set_nodelay`
-//! - `std::net::TcpStream::set_ttl`
-//! - `std::net::TcpStream::set_nonblocking`
-//! - `std::net::TcpListener::set_nodelay`
-//! - `std::net::TcpListener::set_only_v6`
-//! - `std::net::TcpListener::set_nonblocking`
 //!
 //! These functions have varying degrees of compatibility with Fortanix EDP.
 //! See the [EDP docs](https://edp.fortanix.com/docs/concepts/rust-std/) for
