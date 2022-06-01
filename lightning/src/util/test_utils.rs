@@ -31,7 +31,7 @@ use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::transaction::{Transaction, TxOut};
 use bitcoin::blockdata::script::{Builder, Script};
 use bitcoin::blockdata::opcodes;
-use bitcoin::blockdata::block::BlockHeader;
+use bitcoin::blockdata::block::Block;
 use bitcoin::network::constants::Network;
 use bitcoin::hash_types::{BlockHash, Txid};
 
@@ -115,6 +115,11 @@ impl<'a> TestChainMonitor<'a> {
 			keys_manager,
 			expect_channel_force_closed: Mutex::new(None),
 		}
+	}
+
+	pub fn complete_sole_pending_chan_update(&self, channel_id: &[u8; 32]) {
+		let (outpoint, _, latest_update) = self.latest_monitor_update_id.lock().unwrap().get(channel_id).unwrap().clone();
+		self.chain_monitor.channel_monitor_updated(outpoint, latest_update).unwrap();
 	}
 }
 impl<'a> chain::Watch<EnforcingSigner> for TestChainMonitor<'a> {
@@ -224,11 +229,11 @@ impl<Signer: keysinterface::Sign> chainmonitor::Persist<Signer> for TestPersiste
 
 pub struct TestBroadcaster {
 	pub txn_broadcasted: Mutex<Vec<Transaction>>,
-	pub blocks: Arc<Mutex<Vec<(BlockHeader, u32)>>>,
+	pub blocks: Arc<Mutex<Vec<(Block, u32)>>>,
 }
 
 impl TestBroadcaster {
-	pub fn new(blocks: Arc<Mutex<Vec<(BlockHeader, u32)>>>) -> TestBroadcaster {
+	pub fn new(blocks: Arc<Mutex<Vec<(Block, u32)>>>) -> TestBroadcaster {
 		TestBroadcaster { txn_broadcasted: Mutex::new(Vec::new()), blocks }
 	}
 }
@@ -302,8 +307,8 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_funding_signed(&self, _their_node_id: &PublicKey, msg: &msgs::FundingSigned) {
 		self.received_msg(wire::Message::FundingSigned(msg.clone()));
 	}
-	fn handle_funding_locked(&self, _their_node_id: &PublicKey, msg: &msgs::FundingLocked) {
-		self.received_msg(wire::Message::FundingLocked(msg.clone()));
+	fn handle_channel_ready(&self, _their_node_id: &PublicKey, msg: &msgs::ChannelReady) {
+		self.received_msg(wire::Message::ChannelReady(msg.clone()));
 	}
 	fn handle_shutdown(&self, _their_node_id: &PublicKey, _their_features: &InitFeatures, msg: &msgs::Shutdown) {
 		self.received_msg(wire::Message::Shutdown(msg.clone()));

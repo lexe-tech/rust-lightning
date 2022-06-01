@@ -367,7 +367,7 @@ fn do_retry_with_no_persist(confirm_before_reload: bool) {
 	let nodes_0_deserialized: ChannelManager<EnforcingSigner, &test_utils::TestChainMonitor, &test_utils::TestBroadcaster, &test_utils::TestKeysInterface, &test_utils::TestFeeEstimator, &test_utils::TestLogger>;
 	let mut nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
-	let (_, _, chan_id, funding_tx) = create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known());
+	let chan_id = create_announced_chan_between_nodes(&nodes, 0, 1, InitFeatures::known(), InitFeatures::known()).2;
 	let (_, _, chan_id_2, _) = create_announced_chan_between_nodes(&nodes, 1, 2, InitFeatures::known(), InitFeatures::known());
 
 	// Serialize the ChannelManager prior to sending payments
@@ -376,7 +376,7 @@ fn do_retry_with_no_persist(confirm_before_reload: bool) {
 	// Send two payments - one which will get to nodes[2] and will be claimed, one which we'll time
 	// out and retry.
 	let (route, payment_hash, payment_preimage, payment_secret) = get_route_and_payment_hash!(nodes[0], nodes[2], 1_000_000);
-	let (payment_preimage_1, _, _, payment_id_1) = send_along_route(&nodes[0], route.clone(), &[&nodes[1], &nodes[2]], 1_000_000);
+	let (payment_preimage_1, payment_hash_1, _, payment_id_1) = send_along_route(&nodes[0], route.clone(), &[&nodes[1], &nodes[2]], 1_000_000);
 	let payment_id = nodes[0].node.send_payment(&route, payment_hash, &Some(payment_secret)).unwrap();
 	check_added_monitors!(nodes[0], 1);
 
@@ -475,6 +475,8 @@ fn do_retry_with_no_persist(confirm_before_reload: bool) {
 	// we close in a moment.
 	nodes[2].node.claim_funds(payment_preimage_1);
 	check_added_monitors!(nodes[2], 1);
+	expect_payment_claimed!(nodes[2], payment_hash_1, 1_000_000);
+
 	let htlc_fulfill_updates = get_htlc_update_msgs!(nodes[2], nodes[1].node.get_our_node_id());
 	nodes[1].node.handle_update_fulfill_htlc(&nodes[2].node.get_our_node_id(), &htlc_fulfill_updates.update_fulfill_htlcs[0]);
 	check_added_monitors!(nodes[1], 1);
@@ -482,7 +484,7 @@ fn do_retry_with_no_persist(confirm_before_reload: bool) {
 
 	if confirm_before_reload {
 		let best_block = nodes[0].blocks.lock().unwrap().last().unwrap().clone();
-		nodes[0].node.best_block_updated(&best_block.0, best_block.1);
+		nodes[0].node.best_block_updated(&best_block.0.header, best_block.1);
 	}
 
 	// Create a new channel on which to retry the payment before we fail the payment via the
@@ -504,14 +506,19 @@ fn do_retry_with_no_persist(confirm_before_reload: bool) {
 	expect_payment_sent!(nodes[0], payment_preimage_1);
 	connect_blocks(&nodes[0], TEST_FINAL_CLTV*4 + 20);
 	let as_htlc_timeout_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-	check_spends!(as_htlc_timeout_txn[2], funding_tx);
-	check_spends!(as_htlc_timeout_txn[0], as_commitment_tx);
-	check_spends!(as_htlc_timeout_txn[1], as_commitment_tx);
 	assert_eq!(as_htlc_timeout_txn.len(), 3);
-	if as_htlc_timeout_txn[0].input[0].previous_output == bs_htlc_claim_txn[0].input[0].previous_output {
-		confirm_transaction(&nodes[0], &as_htlc_timeout_txn[1]);
+	let (first_htlc_timeout_tx, second_htlc_timeout_tx) = if as_htlc_timeout_txn[0] == as_commitment_tx {
+		(&as_htlc_timeout_txn[1], &as_htlc_timeout_txn[2])
 	} else {
-		confirm_transaction(&nodes[0], &as_htlc_timeout_txn[0]);
+		assert_eq!(as_htlc_timeout_txn[2], as_commitment_tx);
+		(&as_htlc_timeout_txn[0], &as_htlc_timeout_txn[1])
+	};
+	check_spends!(first_htlc_timeout_tx, as_commitment_tx);
+	check_spends!(second_htlc_timeout_tx, as_commitment_tx);
+	if first_htlc_timeout_tx.input[0].previous_output == bs_htlc_claim_txn[0].input[0].previous_output {
+		confirm_transaction(&nodes[0], &second_htlc_timeout_tx);
+	} else {
+		confirm_transaction(&nodes[0], &first_htlc_timeout_tx);
 	}
 	nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
 	expect_payment_failed_conditions!(nodes[0], payment_hash, false, PaymentFailedConditions::new().mpp_parts_remain());
@@ -564,7 +571,7 @@ fn do_test_dup_htlc_onchain_fails_on_reload(persist_manager_post_event: bool, co
 
 	// Route a payment, but force-close the channel before the HTLC fulfill message arrives at
 	// nodes[0].
-	let (payment_preimage, payment_hash, _) = route_payment(&nodes[0], &[&nodes[1]], 10000000);
+	let (payment_preimage, payment_hash, _) = route_payment(&nodes[0], &[&nodes[1]], 10_000_000);
 	nodes[0].node.force_close_channel(&nodes[0].node.list_channels()[0].channel_id, &nodes[1].node.get_our_node_id()).unwrap();
 	check_closed_broadcast!(nodes[0], true);
 	check_added_monitors!(nodes[0], 1);
@@ -582,8 +589,9 @@ fn do_test_dup_htlc_onchain_fails_on_reload(persist_manager_post_event: bool, co
 	check_spends!(node_txn[2], node_txn[1]);
 	let timeout_txn = vec![node_txn[2].clone()];
 
-	assert!(nodes[1].node.claim_funds(payment_preimage));
+	nodes[1].node.claim_funds(payment_preimage);
 	check_added_monitors!(nodes[1], 1);
+	expect_payment_claimed!(nodes[1], payment_hash, 10_000_000);
 
 	let mut header = BlockHeader { version: 0x20000000, prev_blockhash: nodes[1].best_block_hash(), merkle_root: Default::default(), time: 42, bits: 42, nonce: 42 };
 	connect_block(&nodes[1], &Block { header, txdata: vec![node_txn[1].clone()]});
@@ -627,7 +635,8 @@ fn do_test_dup_htlc_onchain_fails_on_reload(persist_manager_post_event: bool, co
 	let funding_txo = OutPoint { txid: funding_tx.txid(), index: 0 };
 	let mon_updates: Vec<_> = chanmon_cfgs[0].persister.chain_sync_monitor_persistences.lock().unwrap()
 		.get_mut(&funding_txo).unwrap().drain().collect();
-	assert_eq!(mon_updates.len(), 1);
+	// If we are using chain::Confirm instead of chain::Listen, we will get the same update twice
+	assert!(mon_updates.len() == 1 || mon_updates.len() == 2);
 	assert!(nodes[0].chain_monitor.release_pending_monitor_events().is_empty());
 	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
 
@@ -643,7 +652,9 @@ fn do_test_dup_htlc_onchain_fails_on_reload(persist_manager_post_event: bool, co
 	chanmon_cfgs[0].persister.set_update_ret(Ok(()));
 	let mut chan_0_monitor_serialized = test_utils::TestVecWriter(Vec::new());
 	get_monitor!(nodes[0], chan_id).write(&mut chan_0_monitor_serialized).unwrap();
-	nodes[0].chain_monitor.chain_monitor.channel_monitor_updated(funding_txo, mon_updates[0]).unwrap();
+	for update in mon_updates {
+		nodes[0].chain_monitor.chain_monitor.channel_monitor_updated(funding_txo, update).unwrap();
+	}
 	if payment_timeout {
 		expect_payment_failed!(nodes[0], payment_hash, true);
 	} else {
@@ -740,6 +751,8 @@ fn test_fulfill_restart_failure() {
 
 	nodes[1].node.claim_funds(payment_preimage);
 	check_added_monitors!(nodes[1], 1);
+	expect_payment_claimed!(nodes[1], payment_hash, 100_000);
+
 	let htlc_fulfill_updates = get_htlc_update_msgs!(nodes[1], nodes[0].node.get_our_node_id());
 	nodes[0].node.handle_update_fulfill_htlc(&nodes[1].node.get_our_node_id(), &htlc_fulfill_updates.update_fulfill_htlcs[0]);
 	expect_payment_sent_without_paths!(nodes[0], payment_preimage);

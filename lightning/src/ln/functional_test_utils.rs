@@ -21,6 +21,7 @@ use ln::features::{InitFeatures, InvoiceFeatures};
 use ln::msgs;
 use ln::msgs::{ChannelMessageHandler,RoutingMessageHandler};
 use util::enforcing_trait_impls::EnforcingSigner;
+use util::scid_utils;
 use util::test_utils;
 use util::test_utils::{panicking, TestChainMonitor};
 use util::events::{Event, MessageSendEvent, MessageSendEventsProvider, PaymentPurpose};
@@ -34,6 +35,8 @@ use bitcoin::blockdata::transaction::{Transaction, TxOut};
 use bitcoin::network::constants::Network;
 
 use bitcoin::hash_types::BlockHash;
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::Hash as _;
 
 use bitcoin::secp256k1::PublicKey;
 
@@ -48,9 +51,13 @@ pub const CHAN_CONFIRM_DEPTH: u32 = 10;
 
 /// Mine the given transaction in the next block and then mine CHAN_CONFIRM_DEPTH - 1 blocks on
 /// top, giving the given transaction CHAN_CONFIRM_DEPTH confirmations.
-pub fn confirm_transaction<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction) {
-	confirm_transaction_at(node, tx, node.best_block_info().1 + 1);
+///
+/// Returns the SCID a channel confirmed in the given transaction will have, assuming the funding
+/// output is the 1st output in the transaction.
+pub fn confirm_transaction<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction) -> u64 {
+	let scid = confirm_transaction_at(node, tx, node.best_block_info().1 + 1);
 	connect_blocks(node, CHAN_CONFIRM_DEPTH - 1);
+	scid
 }
 /// Mine a signle block containing the given transaction
 pub fn mine_transaction<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction) {
@@ -59,7 +66,10 @@ pub fn mine_transaction<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transac
 }
 /// Mine the given transaction at the given height, mining blocks as required to build to that
 /// height
-pub fn confirm_transaction_at<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction, conf_height: u32) {
+///
+/// Returns the SCID a channel confirmed in the given transaction will have, assuming the funding
+/// output is the 1st output in the transaction.
+pub fn confirm_transaction_at<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &Transaction, conf_height: u32) -> u64 {
 	let first_connect_height = node.best_block_info().1 + 1;
 	assert!(first_connect_height <= conf_height);
 	if conf_height > first_connect_height {
@@ -74,31 +84,64 @@ pub fn confirm_transaction_at<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, tx: &T
 	}
 	block.txdata.push(tx.clone());
 	connect_block(node, &block);
+	scid_utils::scid_from_parts(conf_height as u64, block.txdata.len() as u64 - 1, 0).unwrap()
 }
 
 /// The possible ways we may notify a ChannelManager of a new block
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConnectStyle {
-	/// Calls best_block_updated first, detecting transactions in the block only after receiving the
-	/// header and height information.
+	/// Calls `best_block_updated` first, detecting transactions in the block only after receiving
+	/// the header and height information.
 	BestBlockFirst,
-	/// The same as BestBlockFirst, however when we have multiple blocks to connect, we only
-	/// make a single best_block_updated call.
+	/// The same as `BestBlockFirst`, however when we have multiple blocks to connect, we only
+	/// make a single `best_block_updated` call.
 	BestBlockFirstSkippingBlocks,
-	/// Calls transactions_confirmed first, detecting transactions in the block before updating the
-	/// header and height information.
+	/// The same as `BestBlockFirst` when connecting blocks. During disconnection only
+	/// `transaction_unconfirmed` is called.
+	BestBlockFirstReorgsOnlyTip,
+	/// Calls `transactions_confirmed` first, detecting transactions in the block before updating
+	/// the header and height information.
 	TransactionsFirst,
-	/// The same as TransactionsFirst, however when we have multiple blocks to connect, we only
-	/// make a single best_block_updated call.
+	/// The same as `TransactionsFirst`, however when we have multiple blocks to connect, we only
+	/// make a single `best_block_updated` call.
 	TransactionsFirstSkippingBlocks,
-	/// Provides the full block via the chain::Listen interface. In the current code this is
-	/// equivalent to TransactionsFirst with some additional assertions.
+	/// The same as `TransactionsFirst` when connecting blocks. During disconnection only
+	/// `transaction_unconfirmed` is called.
+	TransactionsFirstReorgsOnlyTip,
+	/// Provides the full block via the `chain::Listen` interface. In the current code this is
+	/// equivalent to `TransactionsFirst` with some additional assertions.
 	FullBlockViaListen,
+}
+
+impl ConnectStyle {
+	fn random_style() -> ConnectStyle {
+		#[cfg(feature = "std")] {
+			use core::hash::{BuildHasher, Hasher};
+			// Get a random value using the only std API to do so - the DefaultHasher
+			let rand_val = std::collections::hash_map::RandomState::new().build_hasher().finish();
+			let res = match rand_val % 7 {
+				0 => ConnectStyle::BestBlockFirst,
+				1 => ConnectStyle::BestBlockFirstSkippingBlocks,
+				2 => ConnectStyle::BestBlockFirstReorgsOnlyTip,
+				3 => ConnectStyle::TransactionsFirst,
+				4 => ConnectStyle::TransactionsFirstSkippingBlocks,
+				5 => ConnectStyle::TransactionsFirstReorgsOnlyTip,
+				6 => ConnectStyle::FullBlockViaListen,
+				_ => unreachable!(),
+			};
+			eprintln!("Using Block Connection Style: {:?}", res);
+			res
+		}
+		#[cfg(not(feature = "std"))] {
+			ConnectStyle::FullBlockViaListen
+		}
+	}
 }
 
 pub fn connect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, depth: u32) -> BlockHash {
 	let skip_intermediaries = match *node.connect_style.borrow() {
-		ConnectStyle::BestBlockFirstSkippingBlocks|ConnectStyle::TransactionsFirstSkippingBlocks => true,
+		ConnectStyle::BestBlockFirstSkippingBlocks|ConnectStyle::TransactionsFirstSkippingBlocks|
+			ConnectStyle::BestBlockFirstReorgsOnlyTip|ConnectStyle::TransactionsFirstReorgsOnlyTip => true,
 		_ => false,
 	};
 
@@ -109,18 +152,20 @@ pub fn connect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, depth: u32) ->
 	};
 	assert!(depth >= 1);
 	for i in 1..depth {
-		do_connect_block(node, &block, skip_intermediaries);
+		let prev_blockhash = block.header.block_hash();
+		do_connect_block(node, block, skip_intermediaries);
 		block = Block {
-			header: BlockHeader { version: 0x20000000, prev_blockhash: block.header.block_hash(), merkle_root: Default::default(), time: height + i, bits: 42, nonce: 42 },
+			header: BlockHeader { version: 0x20000000, prev_blockhash, merkle_root: Default::default(), time: height + i, bits: 42, nonce: 42 },
 			txdata: vec![],
 		};
 	}
-	connect_block(node, &block);
-	block.header.block_hash()
+	let hash = block.header.block_hash();
+	do_connect_block(node, block, false);
+	hash
 }
 
 pub fn connect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, block: &Block) {
-	do_connect_block(node, block, false);
+	do_connect_block(node, block.clone(), false);
 }
 
 fn call_claimable_balances<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>) {
@@ -130,20 +175,23 @@ fn call_claimable_balances<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>) {
 	}
 }
 
-fn do_connect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, block: &Block, skip_intermediaries: bool) {
+fn do_connect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, block: Block, skip_intermediaries: bool) {
 	call_claimable_balances(node);
 	let height = node.best_block_info().1 + 1;
+	#[cfg(feature = "std")] {
+		eprintln!("Connecting block using Block Connection Style: {:?}", *node.connect_style.borrow());
+	}
 	if !skip_intermediaries {
 		let txdata: Vec<_> = block.txdata.iter().enumerate().collect();
 		match *node.connect_style.borrow() {
-			ConnectStyle::BestBlockFirst|ConnectStyle::BestBlockFirstSkippingBlocks => {
+			ConnectStyle::BestBlockFirst|ConnectStyle::BestBlockFirstSkippingBlocks|ConnectStyle::BestBlockFirstReorgsOnlyTip => {
 				node.chain_monitor.chain_monitor.best_block_updated(&block.header, height);
 				call_claimable_balances(node);
 				node.chain_monitor.chain_monitor.transactions_confirmed(&block.header, &txdata, height);
 				node.node.best_block_updated(&block.header, height);
 				node.node.transactions_confirmed(&block.header, &txdata, height);
 			},
-			ConnectStyle::TransactionsFirst|ConnectStyle::TransactionsFirstSkippingBlocks => {
+			ConnectStyle::TransactionsFirst|ConnectStyle::TransactionsFirstSkippingBlocks|ConnectStyle::TransactionsFirstReorgsOnlyTip => {
 				node.chain_monitor.chain_monitor.transactions_confirmed(&block.header, &txdata, height);
 				call_claimable_balances(node);
 				node.chain_monitor.chain_monitor.best_block_updated(&block.header, height);
@@ -158,30 +206,39 @@ fn do_connect_block<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, block: &Block, s
 	}
 	call_claimable_balances(node);
 	node.node.test_process_background_events();
-	node.blocks.lock().unwrap().push((block.header, height));
+	node.blocks.lock().unwrap().push((block, height));
 }
 
 pub fn disconnect_blocks<'a, 'b, 'c, 'd>(node: &'a Node<'b, 'c, 'd>, count: u32) {
 	call_claimable_balances(node);
+	#[cfg(feature = "std")] {
+		eprintln!("Disconnecting {} blocks using Block Connection Style: {:?}", count, *node.connect_style.borrow());
+	}
 	for i in 0..count {
-		let orig_header = node.blocks.lock().unwrap().pop().unwrap();
-		assert!(orig_header.1 > 0); // Cannot disconnect genesis
-		let prev_header = node.blocks.lock().unwrap().last().unwrap().clone();
+		let orig = node.blocks.lock().unwrap().pop().unwrap();
+		assert!(orig.1 > 0); // Cannot disconnect genesis
+		let prev = node.blocks.lock().unwrap().last().unwrap().clone();
 
 		match *node.connect_style.borrow() {
 			ConnectStyle::FullBlockViaListen => {
-				node.chain_monitor.chain_monitor.block_disconnected(&orig_header.0, orig_header.1);
-				Listen::block_disconnected(node.node, &orig_header.0, orig_header.1);
+				node.chain_monitor.chain_monitor.block_disconnected(&orig.0.header, orig.1);
+				Listen::block_disconnected(node.node, &orig.0.header, orig.1);
 			},
 			ConnectStyle::BestBlockFirstSkippingBlocks|ConnectStyle::TransactionsFirstSkippingBlocks => {
 				if i == count - 1 {
-					node.chain_monitor.chain_monitor.best_block_updated(&prev_header.0, prev_header.1);
-					node.node.best_block_updated(&prev_header.0, prev_header.1);
+					node.chain_monitor.chain_monitor.best_block_updated(&prev.0.header, prev.1);
+					node.node.best_block_updated(&prev.0.header, prev.1);
+				}
+			},
+			ConnectStyle::BestBlockFirstReorgsOnlyTip|ConnectStyle::TransactionsFirstReorgsOnlyTip => {
+				for tx in orig.0.txdata {
+					node.chain_monitor.chain_monitor.transaction_unconfirmed(&tx.txid());
+					node.node.transaction_unconfirmed(&tx.txid());
 				}
 			},
 			_ => {
-				node.chain_monitor.chain_monitor.best_block_updated(&prev_header.0, prev_header.1);
-				node.node.best_block_updated(&prev_header.0, prev_header.1);
+				node.chain_monitor.chain_monitor.best_block_updated(&prev.0.header, prev.1);
+				node.node.best_block_updated(&prev.0.header, prev.1);
 			},
 		}
 		call_claimable_balances(node);
@@ -227,7 +284,7 @@ pub struct Node<'a, 'b: 'a, 'c: 'b> {
 	pub network_payment_count: Rc<RefCell<u8>>,
 	pub network_chan_count: Rc<RefCell<u32>>,
 	pub logger: &'c test_utils::TestLogger,
-	pub blocks: Arc<Mutex<Vec<(BlockHeader, u32)>>>,
+	pub blocks: Arc<Mutex<Vec<(Block, u32)>>>,
 	pub connect_style: Rc<RefCell<ConnectStyle>>,
 }
 impl<'a, 'b, 'c> Node<'a, 'b, 'c> {
@@ -238,7 +295,7 @@ impl<'a, 'b, 'c> Node<'a, 'b, 'c> {
 		self.blocks.lock().unwrap().last().map(|(a, b)| (a.block_hash(), *b)).unwrap()
 	}
 	pub fn get_block_header(&self, height: u32) -> BlockHeader {
-		self.blocks.lock().unwrap()[height as usize].0
+		self.blocks.lock().unwrap()[height as usize].0.header
 	}
 }
 
@@ -343,8 +400,8 @@ pub fn create_chan_between_nodes<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, n
 }
 
 pub fn create_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, channel_value: u64, push_msat: u64, a_flags: InitFeatures, b_flags: InitFeatures) -> (msgs::ChannelAnnouncement, msgs::ChannelUpdate, msgs::ChannelUpdate, [u8; 32], Transaction) {
-	let (funding_locked, channel_id, tx) = create_chan_between_nodes_with_value_a(node_a, node_b, channel_value, push_msat, a_flags, b_flags);
-	let (announcement, as_update, bs_update) = create_chan_between_nodes_with_value_b(node_a, node_b, &funding_locked);
+	let (channel_ready, channel_id, tx) = create_chan_between_nodes_with_value_a(node_a, node_b, channel_value, push_msat, a_flags, b_flags);
+	let (announcement, as_update, bs_update) = create_chan_between_nodes_with_value_b(node_a, node_b, &channel_ready);
 	(announcement, as_update, bs_update, channel_id, tx)
 }
 
@@ -628,10 +685,10 @@ pub fn create_chan_between_nodes_with_value_init<'a, 'b, 'c>(node_a: &Node<'a, '
 pub fn create_chan_between_nodes_with_value_confirm_first<'a, 'b, 'c, 'd>(node_recv: &'a Node<'b, 'c, 'c>, node_conf: &'a Node<'b, 'c, 'd>, tx: &Transaction, conf_height: u32) {
 	confirm_transaction_at(node_conf, tx, conf_height);
 	connect_blocks(node_conf, CHAN_CONFIRM_DEPTH - 1);
-	node_recv.node.handle_funding_locked(&node_conf.node.get_our_node_id(), &get_event_msg!(node_conf, MessageSendEvent::SendFundingLocked, node_recv.node.get_our_node_id()));
+	node_recv.node.handle_channel_ready(&node_conf.node.get_our_node_id(), &get_event_msg!(node_conf, MessageSendEvent::SendChannelReady, node_recv.node.get_our_node_id()));
 }
 
-pub fn create_chan_between_nodes_with_value_confirm_second<'a, 'b, 'c>(node_recv: &Node<'a, 'b, 'c>, node_conf: &Node<'a, 'b, 'c>) -> ((msgs::FundingLocked, msgs::AnnouncementSignatures), [u8; 32]) {
+pub fn create_chan_between_nodes_with_value_confirm_second<'a, 'b, 'c>(node_recv: &Node<'a, 'b, 'c>, node_conf: &Node<'a, 'b, 'c>) -> ((msgs::ChannelReady, msgs::AnnouncementSignatures), [u8; 32]) {
 	let channel_id;
 	let events_6 = node_conf.node.get_and_clear_pending_msg_events();
 	assert_eq!(events_6.len(), 3);
@@ -643,7 +700,7 @@ pub fn create_chan_between_nodes_with_value_confirm_second<'a, 'b, 'c>(node_recv
 		1
 	} else { panic!("Unexpected event: {:?}", events_6[1]); };
 	((match events_6[0] {
-		MessageSendEvent::SendFundingLocked { ref node_id, ref msg } => {
+		MessageSendEvent::SendChannelReady { ref node_id, ref msg } => {
 			channel_id = msg.channel_id.clone();
 			assert_eq!(*node_id, node_recv.node.get_our_node_id());
 			msg.clone()
@@ -658,7 +715,7 @@ pub fn create_chan_between_nodes_with_value_confirm_second<'a, 'b, 'c>(node_recv
 	}), channel_id)
 }
 
-pub fn create_chan_between_nodes_with_value_confirm<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, tx: &Transaction) -> ((msgs::FundingLocked, msgs::AnnouncementSignatures), [u8; 32]) {
+pub fn create_chan_between_nodes_with_value_confirm<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, tx: &Transaction) -> ((msgs::ChannelReady, msgs::AnnouncementSignatures), [u8; 32]) {
 	let conf_height = core::cmp::max(node_a.best_block_info().1 + 1, node_b.best_block_info().1 + 1);
 	create_chan_between_nodes_with_value_confirm_first(node_a, node_b, tx, conf_height);
 	confirm_transaction_at(node_a, tx, conf_height);
@@ -666,14 +723,14 @@ pub fn create_chan_between_nodes_with_value_confirm<'a, 'b, 'c, 'd>(node_a: &'a 
 	create_chan_between_nodes_with_value_confirm_second(node_b, node_a)
 }
 
-pub fn create_chan_between_nodes_with_value_a<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, channel_value: u64, push_msat: u64, a_flags: InitFeatures, b_flags: InitFeatures) -> ((msgs::FundingLocked, msgs::AnnouncementSignatures), [u8; 32], Transaction) {
+pub fn create_chan_between_nodes_with_value_a<'a, 'b, 'c, 'd>(node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, channel_value: u64, push_msat: u64, a_flags: InitFeatures, b_flags: InitFeatures) -> ((msgs::ChannelReady, msgs::AnnouncementSignatures), [u8; 32], Transaction) {
 	let tx = create_chan_between_nodes_with_value_init(node_a, node_b, channel_value, push_msat, a_flags, b_flags);
 	let (msgs, chan_id) = create_chan_between_nodes_with_value_confirm(node_a, node_b, &tx);
 	(msgs, chan_id, tx)
 }
 
-pub fn create_chan_between_nodes_with_value_b<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 'b, 'c>, as_funding_msgs: &(msgs::FundingLocked, msgs::AnnouncementSignatures)) -> (msgs::ChannelAnnouncement, msgs::ChannelUpdate, msgs::ChannelUpdate) {
-	node_b.node.handle_funding_locked(&node_a.node.get_our_node_id(), &as_funding_msgs.0);
+pub fn create_chan_between_nodes_with_value_b<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 'b, 'c>, as_funding_msgs: &(msgs::ChannelReady, msgs::AnnouncementSignatures)) -> (msgs::ChannelAnnouncement, msgs::ChannelUpdate, msgs::ChannelUpdate) {
+	node_b.node.handle_channel_ready(&node_a.node.get_our_node_id(), &as_funding_msgs.0);
 	let bs_announcement_sigs = get_event_msg!(node_b, MessageSendEvent::SendAnnouncementSignatures, node_a.node.get_our_node_id());
 	node_b.node.handle_announcement_signatures(&node_a.node.get_our_node_id(), &as_funding_msgs.1);
 
@@ -714,7 +771,7 @@ pub fn create_announced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &'a
 	(chan_announcement.1, chan_announcement.2, chan_announcement.3, chan_announcement.4)
 }
 
-pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &'a Vec<Node<'b, 'c, 'd>>, a: usize, b: usize, channel_value: u64, push_msat: u64, a_flags: InitFeatures, b_flags: InitFeatures) -> (msgs::FundingLocked, Transaction) {
+pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &'a Vec<Node<'b, 'c, 'd>>, a: usize, b: usize, channel_value: u64, push_msat: u64, a_flags: InitFeatures, b_flags: InitFeatures) -> (msgs::ChannelReady, Transaction) {
 	let mut no_announce_cfg = test_default_channel_config();
 	no_announce_cfg.channel_options.announced_channel = false;
 	nodes[a].node.create_channel(nodes[b].node.get_our_node_id(), channel_value, push_msat, 42, Some(no_announce_cfg)).unwrap();
@@ -737,10 +794,10 @@ pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &
 	connect_blocks(&nodes[a], CHAN_CONFIRM_DEPTH - 1);
 	confirm_transaction_at(&nodes[b], &tx, conf_height);
 	connect_blocks(&nodes[b], CHAN_CONFIRM_DEPTH - 1);
-	let as_funding_locked = get_event_msg!(nodes[a], MessageSendEvent::SendFundingLocked, nodes[b].node.get_our_node_id());
-	nodes[a].node.handle_funding_locked(&nodes[b].node.get_our_node_id(), &get_event_msg!(nodes[b], MessageSendEvent::SendFundingLocked, nodes[a].node.get_our_node_id()));
+	let as_channel_ready = get_event_msg!(nodes[a], MessageSendEvent::SendChannelReady, nodes[b].node.get_our_node_id());
+	nodes[a].node.handle_channel_ready(&nodes[b].node.get_our_node_id(), &get_event_msg!(nodes[b], MessageSendEvent::SendChannelReady, nodes[a].node.get_our_node_id()));
 	let as_update = get_event_msg!(nodes[a], MessageSendEvent::SendChannelUpdate, nodes[b].node.get_our_node_id());
-	nodes[b].node.handle_funding_locked(&nodes[a].node.get_our_node_id(), &as_funding_locked);
+	nodes[b].node.handle_channel_ready(&nodes[a].node.get_our_node_id(), &as_channel_ready);
 	let bs_update = get_event_msg!(nodes[b], MessageSendEvent::SendChannelUpdate, nodes[a].node.get_our_node_id());
 
 	nodes[a].node.handle_channel_update(&nodes[b].node.get_our_node_id(), &bs_update);
@@ -748,7 +805,7 @@ pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &
 
 	let mut found_a = false;
 	for chan in nodes[a].node.list_usable_channels() {
-		if chan.channel_id == as_funding_locked.channel_id {
+		if chan.channel_id == as_channel_ready.channel_id {
 			assert!(!found_a);
 			found_a = true;
 			assert!(!chan.is_public);
@@ -758,7 +815,7 @@ pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &
 
 	let mut found_b = false;
 	for chan in nodes[b].node.list_usable_channels() {
-		if chan.channel_id == as_funding_locked.channel_id {
+		if chan.channel_id == as_channel_ready.channel_id {
 			assert!(!found_b);
 			found_b = true;
 			assert!(!chan.is_public);
@@ -766,7 +823,7 @@ pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(nodes: &
 	}
 	assert!(found_b);
 
-	(as_funding_locked, tx)
+	(as_channel_ready, tx)
 }
 
 pub fn update_nodes_with_chan_announce<'a, 'b, 'c, 'd>(nodes: &'a Vec<Node<'b, 'c, 'd>>, a: usize, b: usize, ann: &msgs::ChannelAnnouncement, upd_1: &msgs::ChannelUpdate, upd_2: &msgs::ChannelUpdate) {
@@ -1250,9 +1307,9 @@ macro_rules! expect_payment_received {
 		let events = $node.node.get_and_clear_pending_events();
 		assert_eq!(events.len(), 1);
 		match events[0] {
-			$crate::util::events::Event::PaymentReceived { ref payment_hash, ref purpose, amt } => {
+			$crate::util::events::Event::PaymentReceived { ref payment_hash, ref purpose, amount_msat } => {
 				assert_eq!($expected_payment_hash, *payment_hash);
-				assert_eq!($expected_recv_value, amt);
+				assert_eq!($expected_recv_value, amount_msat);
 				match purpose {
 					$crate::util::events::PaymentPurpose::InvoicePayment { payment_preimage, payment_secret, .. } => {
 						assert_eq!(&$expected_payment_preimage, payment_preimage);
@@ -1260,6 +1317,22 @@ macro_rules! expect_payment_received {
 					},
 					_ => {},
 				}
+			},
+			_ => panic!("Unexpected event"),
+		}
+	}
+}
+
+#[macro_export]
+#[cfg(any(test, feature = "_bench_unstable", feature = "_test_utils"))]
+macro_rules! expect_payment_claimed {
+	($node: expr, $expected_payment_hash: expr, $expected_recv_value: expr) => {
+		let events = $node.node.get_and_clear_pending_events();
+		assert_eq!(events.len(), 1);
+		match events[0] {
+			$crate::util::events::Event::PaymentClaimed { ref payment_hash, amount_msat, .. } => {
+				assert_eq!($expected_payment_hash, *payment_hash);
+				assert_eq!($expected_recv_value, amount_msat);
 			},
 			_ => panic!("Unexpected event"),
 		}
@@ -1476,7 +1549,7 @@ pub fn send_along_route_with_secret<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, 
 	payment_id
 }
 
-pub fn pass_along_path<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_path: &[&Node<'a, 'b, 'c>], recv_value: u64, our_payment_hash: PaymentHash, our_payment_secret: Option<PaymentSecret>, ev: MessageSendEvent, payment_received_expected: bool, expected_preimage: Option<PaymentPreimage>) {
+pub fn do_pass_along_path<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_path: &[&Node<'a, 'b, 'c>], recv_value: u64, our_payment_hash: PaymentHash, our_payment_secret: Option<PaymentSecret>, ev: MessageSendEvent, payment_received_expected: bool, clear_recipient_events: bool, expected_preimage: Option<PaymentPreimage>) {
 	let mut payment_event = SendEvent::from_event(ev);
 	let mut prev_node = origin_node;
 
@@ -1489,12 +1562,12 @@ pub fn pass_along_path<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_path
 
 		expect_pending_htlcs_forwardable!(node);
 
-		if idx == expected_path.len() - 1 {
+		if idx == expected_path.len() - 1 && clear_recipient_events {
 			let events_2 = node.node.get_and_clear_pending_events();
 			if payment_received_expected {
 				assert_eq!(events_2.len(), 1);
 				match events_2[0] {
-					Event::PaymentReceived { ref payment_hash, ref purpose, amt} => {
+					Event::PaymentReceived { ref payment_hash, ref purpose, amount_msat } => {
 						assert_eq!(our_payment_hash, *payment_hash);
 						match &purpose {
 							PaymentPurpose::InvoicePayment { payment_preimage, payment_secret, .. } => {
@@ -1506,14 +1579,14 @@ pub fn pass_along_path<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_path
 								assert!(our_payment_secret.is_none());
 							},
 						}
-						assert_eq!(amt, recv_value);
+						assert_eq!(amount_msat, recv_value);
 					},
 					_ => panic!("Unexpected event"),
 				}
 			} else {
 				assert!(events_2.is_empty());
 			}
-		} else {
+		} else if idx != expected_path.len() - 1 {
 			let mut events_2 = node.node.get_and_clear_pending_msg_events();
 			assert_eq!(events_2.len(), 1);
 			check_added_monitors!(node, 1);
@@ -1523,6 +1596,10 @@ pub fn pass_along_path<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_path
 
 		prev_node = node;
 	}
+}
+
+pub fn pass_along_path<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_path: &[&Node<'a, 'b, 'c>], recv_value: u64, our_payment_hash: PaymentHash, our_payment_secret: Option<PaymentSecret>, ev: MessageSendEvent, payment_received_expected: bool, expected_preimage: Option<PaymentPreimage>) {
+	do_pass_along_path(origin_node, expected_path, recv_value, our_payment_hash, our_payment_secret, ev, payment_received_expected, true, expected_preimage);
 }
 
 pub fn pass_along_route<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_route: &[&[&Node<'a, 'b, 'c>]], recv_value: u64, our_payment_hash: PaymentHash, our_payment_secret: PaymentSecret) {
@@ -1546,7 +1623,19 @@ pub fn do_claim_payment_along_route<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, 
 	for path in expected_paths.iter() {
 		assert_eq!(path.last().unwrap().node.get_our_node_id(), expected_paths[0].last().unwrap().node.get_our_node_id());
 	}
-	assert!(expected_paths[0].last().unwrap().node.claim_funds(our_payment_preimage));
+	expected_paths[0].last().unwrap().node.claim_funds(our_payment_preimage);
+
+	let claim_event = expected_paths[0].last().unwrap().node.get_and_clear_pending_events();
+	assert_eq!(claim_event.len(), 1);
+	match claim_event[0] {
+		Event::PaymentClaimed { purpose: PaymentPurpose::SpontaneousPayment(preimage), .. }|
+		Event::PaymentClaimed { purpose: PaymentPurpose::InvoicePayment { payment_preimage: Some(preimage), ..}, .. } =>
+			assert_eq!(preimage, our_payment_preimage),
+		Event::PaymentClaimed { purpose: PaymentPurpose::InvoicePayment { .. }, payment_hash, .. } =>
+			assert_eq!(&payment_hash.0, &Sha256::hash(&our_payment_preimage.0)[..]),
+		_ => panic!(),
+	}
+
 	check_added_monitors!(expected_paths[0].last().unwrap(), expected_paths.len());
 
 	let mut expected_total_fee_msat = 0;
@@ -1641,7 +1730,7 @@ pub fn do_claim_payment_along_route<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, 
 	}
 
 	// Ensure that claim_funds is idempotent.
-	assert!(!expected_paths[0].last().unwrap().node.claim_funds(our_payment_preimage));
+	expected_paths[0].last().unwrap().node.claim_funds(our_payment_preimage);
 	assert!(expected_paths[0].last().unwrap().node.get_and_clear_pending_msg_events().is_empty());
 	check_added_monitors!(expected_paths[0].last().unwrap(), 0);
 
@@ -1701,13 +1790,18 @@ pub fn send_payment<'a, 'b, 'c>(origin: &Node<'a, 'b, 'c>, expected_route: &[&No
 	claim_payment(&origin, expected_route, our_payment_preimage);
 }
 
-pub fn fail_payment_along_route<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_paths_slice: &[&[&Node<'a, 'b, 'c>]], skip_last: bool, our_payment_hash: PaymentHash)  {
-	let mut expected_paths: Vec<_> = expected_paths_slice.iter().collect();
+pub fn fail_payment_along_route<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_paths: &[&[&Node<'a, 'b, 'c>]], skip_last: bool, our_payment_hash: PaymentHash) {
 	for path in expected_paths.iter() {
 		assert_eq!(path.last().unwrap().node.get_our_node_id(), expected_paths[0].last().unwrap().node.get_our_node_id());
 	}
-	assert!(expected_paths[0].last().unwrap().node.fail_htlc_backwards(&our_payment_hash));
+	expected_paths[0].last().unwrap().node.fail_htlc_backwards(&our_payment_hash);
 	expect_pending_htlcs_forwardable!(expected_paths[0].last().unwrap());
+
+	pass_failed_payment_back(origin_node, expected_paths, skip_last, our_payment_hash);
+}
+
+pub fn pass_failed_payment_back<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expected_paths_slice: &[&[&Node<'a, 'b, 'c>]], skip_last: bool, our_payment_hash: PaymentHash) {
+	let mut expected_paths: Vec<_> = expected_paths_slice.iter().collect();
 	check_added_monitors!(expected_paths[0].last().unwrap(), expected_paths.len());
 
 	let mut per_path_msgs: Vec<((msgs::UpdateFailHTLC, msgs::CommitmentSigned), PublicKey)> = Vec::with_capacity(expected_paths.len());
@@ -1806,7 +1900,7 @@ pub fn fail_payment_along_route<'a, 'b, 'c>(origin_node: &Node<'a, 'b, 'c>, expe
 	}
 
 	// Ensure that fail_htlc_backwards is idempotent.
-	assert!(!expected_paths[0].last().unwrap().node.fail_htlc_backwards(&our_payment_hash));
+	expected_paths[0].last().unwrap().node.fail_htlc_backwards(&our_payment_hash);
 	assert!(expected_paths[0].last().unwrap().node.get_and_clear_pending_events().is_empty());
 	assert!(expected_paths[0].last().unwrap().node.get_and_clear_pending_msg_events().is_empty());
 	check_added_monitors!(expected_paths[0].last().unwrap(), 0);
@@ -1821,7 +1915,7 @@ pub fn create_chanmon_cfgs(node_count: usize) -> Vec<TestChanMonCfg> {
 	for i in 0..node_count {
 		let tx_broadcaster = test_utils::TestBroadcaster {
 			txn_broadcasted: Mutex::new(Vec::new()),
-			blocks: Arc::new(Mutex::new(vec![(genesis_block(Network::Testnet).header, 0)])),
+			blocks: Arc::new(Mutex::new(vec![(genesis_block(Network::Testnet), 0)])),
 		};
 		let fee_estimator = test_utils::TestFeeEstimator { sat_per_kw: Mutex::new(253) };
 		let chain_source = test_utils::TestChainSource::new(Network::Testnet);
@@ -1895,7 +1989,7 @@ pub fn create_network<'a, 'b: 'a, 'c: 'b>(node_count: usize, cfgs: &'b Vec<NodeC
 	let mut nodes = Vec::new();
 	let chan_count = Rc::new(RefCell::new(0));
 	let payment_count = Rc::new(RefCell::new(0));
-	let connect_style = Rc::new(RefCell::new(ConnectStyle::FullBlockViaListen));
+	let connect_style = Rc::new(RefCell::new(ConnectStyle::random_style()));
 
 	for i in 0..node_count {
 		let net_graph_msg_handler = NetGraphMsgHandler::new(cfgs[i].network_graph, None, cfgs[i].logger);
@@ -2106,7 +2200,7 @@ macro_rules! handle_chan_reestablish_msgs {
 		{
 			let msg_events = $src_node.node.get_and_clear_pending_msg_events();
 			let mut idx = 0;
-			let funding_locked = if let Some(&MessageSendEvent::SendFundingLocked { ref node_id, ref msg }) = msg_events.get(0) {
+			let channel_ready = if let Some(&MessageSendEvent::SendChannelReady { ref node_id, ref msg }) = msg_events.get(0) {
 				idx += 1;
 				assert_eq!(*node_id, $dst_node.node.get_our_node_id());
 				Some(msg.clone())
@@ -2167,35 +2261,35 @@ macro_rules! handle_chan_reestablish_msgs {
 
 			assert_eq!(msg_events.len(), idx);
 
-			(funding_locked, revoke_and_ack, commitment_update, order)
+			(channel_ready, revoke_and_ack, commitment_update, order)
 		}
 	}
 }
 
 /// pending_htlc_adds includes both the holding cell and in-flight update_add_htlcs, whereas
 /// for claims/fails they are separated out.
-pub fn reconnect_nodes<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 'b, 'c>, send_funding_locked: (bool, bool), pending_htlc_adds: (i64, i64), pending_htlc_claims: (usize, usize), pending_htlc_fails: (usize, usize), pending_cell_htlc_claims: (usize, usize), pending_cell_htlc_fails: (usize, usize), pending_raa: (bool, bool))  {
+pub fn reconnect_nodes<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 'b, 'c>, send_channel_ready: (bool, bool), pending_htlc_adds: (i64, i64), pending_htlc_claims: (usize, usize), pending_htlc_fails: (usize, usize), pending_cell_htlc_claims: (usize, usize), pending_cell_htlc_fails: (usize, usize), pending_raa: (bool, bool))  {
 	node_a.node.peer_connected(&node_b.node.get_our_node_id(), &msgs::Init { features: InitFeatures::empty(), remote_network_address: None });
 	let reestablish_1 = get_chan_reestablish_msgs!(node_a, node_b);
 	node_b.node.peer_connected(&node_a.node.get_our_node_id(), &msgs::Init { features: InitFeatures::empty(), remote_network_address: None });
 	let reestablish_2 = get_chan_reestablish_msgs!(node_b, node_a);
 
-	if send_funding_locked.0 {
-		// If a expects a funding_locked, it better not think it has received a revoke_and_ack
+	if send_channel_ready.0 {
+		// If a expects a channel_ready, it better not think it has received a revoke_and_ack
 		// from b
 		for reestablish in reestablish_1.iter() {
 			assert_eq!(reestablish.next_remote_commitment_number, 0);
 		}
 	}
-	if send_funding_locked.1 {
-		// If b expects a funding_locked, it better not think it has received a revoke_and_ack
+	if send_channel_ready.1 {
+		// If b expects a channel_ready, it better not think it has received a revoke_and_ack
 		// from a
 		for reestablish in reestablish_2.iter() {
 			assert_eq!(reestablish.next_remote_commitment_number, 0);
 		}
 	}
-	if send_funding_locked.0 || send_funding_locked.1 {
-		// If we expect any funding_locked's, both sides better have set
+	if send_channel_ready.0 || send_channel_ready.1 {
+		// If we expect any channel_ready's, both sides better have set
 		// next_holder_commitment_number to 1
 		for reestablish in reestablish_1.iter() {
 			assert_eq!(reestablish.next_local_commitment_number, 1);
@@ -2234,8 +2328,8 @@ pub fn reconnect_nodes<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 
 			 pending_cell_htlc_claims.1 == 0 && pending_cell_htlc_fails.1 == 0));
 
 	for chan_msgs in resp_1.drain(..) {
-		if send_funding_locked.0 {
-			node_a.node.handle_funding_locked(&node_b.node.get_our_node_id(), &chan_msgs.0.unwrap());
+		if send_channel_ready.0 {
+			node_a.node.handle_channel_ready(&node_b.node.get_our_node_id(), &chan_msgs.0.unwrap());
 			let announcement_event = node_a.node.get_and_clear_pending_msg_events();
 			if !announcement_event.is_empty() {
 				assert_eq!(announcement_event.len(), 1);
@@ -2291,8 +2385,8 @@ pub fn reconnect_nodes<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 
 	}
 
 	for chan_msgs in resp_2.drain(..) {
-		if send_funding_locked.1 {
-			node_b.node.handle_funding_locked(&node_a.node.get_our_node_id(), &chan_msgs.0.unwrap());
+		if send_channel_ready.1 {
+			node_b.node.handle_channel_ready(&node_a.node.get_our_node_id(), &chan_msgs.0.unwrap());
 			let announcement_event = node_b.node.get_and_clear_pending_msg_events();
 			if !announcement_event.is_empty() {
 				assert_eq!(announcement_event.len(), 1);

@@ -66,6 +66,14 @@ pub enum PaymentPurpose {
 	SpontaneousPayment(PaymentPreimage),
 }
 
+impl_writeable_tlv_based_enum!(PaymentPurpose,
+	(0, InvoicePayment) => {
+		(0, payment_preimage, option),
+		(2, payment_secret, required),
+	};
+	(2, SpontaneousPayment)
+);
+
 #[derive(Clone, Debug, PartialEq)]
 /// The reason the channel was closed. See individual variants more details.
 pub enum ClosureReason {
@@ -180,8 +188,9 @@ pub enum Event {
 		/// [`ChannelManager::create_channel`]: crate::ln::channelmanager::ChannelManager::create_channel
 		user_channel_id: u64,
 	},
-	/// Indicates we've received money! Just gotta dig out that payment preimage and feed it to
-	/// [`ChannelManager::claim_funds`] to get it....
+	/// Indicates we've received (an offer of) money! Just gotta dig out that payment preimage and
+	/// feed it to [`ChannelManager::claim_funds`] to get it....
+	///
 	/// Note that if the preimage is not known, you should call
 	/// [`ChannelManager::fail_htlc_backwards`] to free up resources for this HTLC and avoid
 	/// network congestion.
@@ -200,9 +209,33 @@ pub enum Event {
 		/// not stop you from registering duplicate payment hashes for inbound payments.
 		payment_hash: PaymentHash,
 		/// The value, in thousandths of a satoshi, that this payment is for.
-		amt: u64,
+		amount_msat: u64,
 		/// Information for claiming this received payment, based on whether the purpose of the
 		/// payment is to pay an invoice or to send a spontaneous payment.
+		purpose: PaymentPurpose,
+	},
+	/// Indicates a payment has been claimed and we've received money!
+	///
+	/// This most likely occurs when [`ChannelManager::claim_funds`] has been called in response
+	/// to an [`Event::PaymentReceived`]. However, if we previously crashed during a
+	/// [`ChannelManager::claim_funds`] call you may see this event without a corresponding
+	/// [`Event::PaymentReceived`] event.
+	///
+	/// # Note
+	/// LDK will not stop an inbound payment from being paid multiple times, so multiple
+	/// `PaymentReceived` events may be generated for the same payment. If you then call
+	/// [`ChannelManager::claim_funds`] twice for the same [`Event::PaymentReceived`] you may get
+	/// multiple `PaymentClaimed` events.
+	///
+	/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
+	PaymentClaimed {
+		/// The payment hash of the claimed payment. Note that LDK will not stop you from
+		/// registering duplicate payment hashes for inbound payments.
+		payment_hash: PaymentHash,
+		/// The value, in thousandths of a satoshi, that this payment is for.
+		amount_msat: u64,
+		/// The purpose of this claimed payment, i.e. whether the payment was for an invoice or a
+		/// spontaneous payment.
 		purpose: PaymentPurpose,
 	},
 	/// Indicates an outbound payment we made succeeded (i.e. it made it all the way to its target
@@ -330,6 +363,10 @@ pub enum Event {
 		/// The payment path that failed.
 		path: Vec<RouteHop>,
 		/// The channel responsible for the failed payment path.
+		///
+		/// Note that for route hints or for the first hop in a path this may be an SCID alias and
+		/// may not refer to a channel in the public network graph. These aliases may also collide
+		/// with channels in the public network graph.
 		///
 		/// If this is `Some`, then the corresponding channel should be avoided when the payment is
 		/// retried. May be `None` for older [`Event`] serializations.
@@ -475,7 +512,7 @@ impl Writeable for Event {
 				// We never write out FundingGenerationReady events as, upon disconnection, peers
 				// drop any channels which have not yet exchanged funding_signed.
 			},
-			&Event::PaymentReceived { ref payment_hash, ref amt, ref purpose } => {
+			&Event::PaymentReceived { ref payment_hash, ref amount_msat, ref purpose } => {
 				1u8.write(writer)?;
 				let mut payment_secret = None;
 				let payment_preimage;
@@ -491,7 +528,7 @@ impl Writeable for Event {
 				write_tlv_fields!(writer, {
 					(0, payment_hash, required),
 					(2, payment_secret, option),
-					(4, amt, required),
+					(4, amount_msat, required),
 					(6, 0u64, required), // user_payment_id required for compatibility with 0.0.103 and earlier
 					(8, payment_preimage, option),
 				});
@@ -584,6 +621,14 @@ impl Writeable for Event {
 				// We never write the OpenChannelRequest events as, upon disconnection, peers
 				// drop any channels which have not yet exchanged funding_signed.
 			},
+			&Event::PaymentClaimed { ref payment_hash, ref amount_msat, ref purpose } => {
+				19u8.write(writer)?;
+				write_tlv_fields!(writer, {
+					(0, payment_hash, required),
+					(2, purpose, required),
+					(4, amount_msat, required),
+				});
+			},
 			// Note that, going forward, all new events must only write data inside of
 			// `write_tlv_fields`. Versions 0.0.101+ will ignore odd-numbered events that write
 			// data via `write_tlv_fields`.
@@ -602,12 +647,12 @@ impl MaybeReadable for Event {
 					let mut payment_hash = PaymentHash([0; 32]);
 					let mut payment_preimage = None;
 					let mut payment_secret = None;
-					let mut amt = 0;
+					let mut amount_msat = 0;
 					let mut _user_payment_id = None::<u64>; // For compatibility with 0.0.103 and earlier
 					read_tlv_fields!(reader, {
 						(0, payment_hash, required),
 						(2, payment_secret, option),
-						(4, amt, required),
+						(4, amount_msat, required),
 						(6, _user_payment_id, option),
 						(8, payment_preimage, option),
 					});
@@ -621,7 +666,7 @@ impl MaybeReadable for Event {
 					};
 					Ok(Some(Event::PaymentReceived {
 						payment_hash,
-						amt,
+						amount_msat,
 						purpose,
 					}))
 				};
@@ -784,6 +829,25 @@ impl MaybeReadable for Event {
 				// Value 17 is used for `Event::OpenChannelRequest`.
 				Ok(None)
 			},
+			19u8 => {
+				let f = || {
+					let mut payment_hash = PaymentHash([0; 32]);
+					let mut purpose = None;
+					let mut amount_msat = 0;
+					read_tlv_fields!(reader, {
+						(0, payment_hash, required),
+						(2, purpose, ignorable),
+						(4, amount_msat, required),
+					});
+					if purpose.is_none() { return Ok(None); }
+					Ok(Some(Event::PaymentClaimed {
+						payment_hash,
+						purpose: purpose.unwrap(),
+						amount_msat,
+					}))
+				};
+				f()
+			},
 			// Versions prior to 0.0.100 did not ignore odd types, instead returning InvalidValue.
 			// Version 0.0.100 failed to properly ignore odd types, possibly resulting in corrupt
 			// reads.
@@ -838,12 +902,12 @@ pub enum MessageSendEvent {
 		/// The message which should be sent.
 		msg: msgs::FundingSigned,
 	},
-	/// Used to indicate that a funding_locked message should be sent to the peer with the given node_id.
-	SendFundingLocked {
+	/// Used to indicate that a channel_ready message should be sent to the peer with the given node_id.
+	SendChannelReady {
 		/// The node_id of the node which should receive these message(s)
 		node_id: PublicKey,
-		/// The funding_locked message which should be sent.
-		msg: msgs::FundingLocked,
+		/// The channel_ready message which should be sent.
+		msg: msgs::ChannelReady,
 	},
 	/// Used to indicate that an announcement_signatures message should be sent to the peer with the given node_id.
 	SendAnnouncementSignatures {
