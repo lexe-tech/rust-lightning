@@ -86,7 +86,6 @@ use lightning::util::logger::Logger;
 
 use std::task;
 use std::net::SocketAddr;
-use std::net::TcpStream as StdTcpStream;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -212,7 +211,7 @@ impl Connection {
 		}
 	}
 
-	fn new(stream: StdTcpStream) -> (io::ReadHalf<TcpStream>, mpsc::Receiver<()>, mpsc::Receiver<()>, Arc<Mutex<Self>>) {
+	fn new(stream: TcpStream) -> (io::ReadHalf<TcpStream>, mpsc::Receiver<()>, mpsc::Receiver<()>, Arc<Mutex<Self>>) {
 		// We only ever need a channel of depth 1 here: if we returned a non-full write to the
 		// PeerManager, we will eventually get notified that there is room in the socket to write
 		// new bytes, which will generate an event. That event will be popped off the queue before
@@ -223,8 +222,7 @@ impl Connection {
 		// we shove a value into the channel which comes after we've reset the read_paused bool to
 		// false.
 		let (read_waker, read_receiver) = mpsc::channel(1);
-		stream.set_nonblocking(true).unwrap();
-		let (reader, writer) = io::split(TcpStream::from_std(stream).unwrap());
+		let (reader, writer) = io::split(stream);
 
 		(reader, write_receiver, read_receiver,
 		Arc::new(Mutex::new(Self {
@@ -235,7 +233,7 @@ impl Connection {
 	}
 }
 
-fn get_addr_from_stream(stream: &StdTcpStream) -> Option<NetAddress> {
+fn get_addr_from_stream(stream: &TcpStream) -> Option<NetAddress> {
 	match stream.peer_addr() {
 		Ok(SocketAddr::V4(sockaddr)) => Some(NetAddress::IPv4 {
 			addr: sockaddr.ip().octets(),
@@ -255,7 +253,7 @@ fn get_addr_from_stream(stream: &StdTcpStream) -> Option<NetAddress> {
 /// The returned future will complete when the peer is disconnected and associated handling
 /// futures are freed, though, because all processing futures are spawned with tokio::spawn, you do
 /// not need to poll the provided future in order to make progress.
-pub fn setup_inbound<CMH, RMH, L, UMH>(peer_manager: Arc<peer_handler::PeerManager<SocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>, stream: StdTcpStream) -> impl std::future::Future<Output=()> where
+pub fn setup_inbound<CMH, RMH, L, UMH>(peer_manager: Arc<peer_handler::PeerManager<SocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>, stream: TcpStream) -> impl std::future::Future<Output=()> where
 		CMH: ChannelMessageHandler + 'static + Send + Sync,
 		RMH: RoutingMessageHandler + 'static + Send + Sync,
 		L: Logger + 'static + ?Sized + Send + Sync,
@@ -297,7 +295,7 @@ pub fn setup_inbound<CMH, RMH, L, UMH>(peer_manager: Arc<peer_handler::PeerManag
 /// The returned future will complete when the peer is disconnected and associated handling
 /// futures are freed, though, because all processing futures are spawned with tokio::spawn, you do
 /// not need to poll the provided future in order to make progress.
-pub fn setup_outbound<CMH, RMH, L, UMH>(peer_manager: Arc<peer_handler::PeerManager<SocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>, their_node_id: PublicKey, stream: StdTcpStream) -> impl std::future::Future<Output=()> where
+pub fn setup_outbound<CMH, RMH, L, UMH>(peer_manager: Arc<peer_handler::PeerManager<SocketDescriptor, Arc<CMH>, Arc<RMH>, Arc<L>, Arc<UMH>>>, their_node_id: PublicKey, stream: TcpStream) -> impl std::future::Future<Output=()> where
 		CMH: ChannelMessageHandler + 'static + Send + Sync,
 		RMH: RoutingMessageHandler + 'static + Send + Sync,
 		L: Logger + 'static + ?Sized + Send + Sync,
@@ -373,7 +371,7 @@ pub async fn connect_outbound<CMH, RMH, L, UMH>(peer_manager: Arc<peer_handler::
 		RMH: RoutingMessageHandler + 'static + Send + Sync,
 		L: Logger + 'static + ?Sized + Send + Sync,
 		UMH: CustomMessageHandler + 'static + Send + Sync {
-	if let Ok(Ok(stream)) = time::timeout(Duration::from_secs(10), async { TcpStream::connect(&addr).await.map(|s| s.into_std().unwrap()) }).await {
+	if let Ok(Ok(stream)) = time::timeout(Duration::from_secs(10), async { TcpStream::connect(&addr).await }).await {
 		Some(setup_outbound(peer_manager, their_node_id, stream))
 	} else { None }
 }
