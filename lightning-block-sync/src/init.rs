@@ -1,14 +1,14 @@
 //! Utilities to assist in the initial sync required to initialize or reload Rust-Lightning objects
 //! from disk.
 
-use crate::{BlockSource, BlockSourceResult, Cache, ChainNotifier};
+use crate::{BlockSource, BlockSourceError, BlockSourceResult, Cache, ChainNotifier};
 use crate::poll::{ChainPoller, Validate, ValidatedBlockHeader};
 
 use bitcoin::blockdata::block::BlockHeader;
 use bitcoin::hash_types::BlockHash;
 use bitcoin::network::constants::Network;
 
-use lightning::chain;
+use lightning::chain::{self, BestBlock};
 
 use std::ops::Deref;
 
@@ -24,6 +24,47 @@ BlockSourceResult<ValidatedBlockHeader> where B::Target: BlockSource {
 	block_source
 		.get_header(&best_block_hash, best_block_height).await?
 		.validate(best_block_hash)
+}
+
+/// Polls the block source, returning a validated block header and [`BestBlock`]
+/// corresponding to the block source's best chain tip.
+///
+/// Upon success, the returned header can be used to initialize [`SpvClient`],
+/// and the returned [`BestBlock`] can be passed into [`ChannelManager::new`]
+/// as part of its [`ChainParameters`]. Initializing the channel manager and spv
+/// client with the outputs of this function ensures that the channel manager
+/// and [`SpvClient`] are synced to the same block during a fresh start.
+///
+/// [`SpvClient`]: crate::SpvClient
+/// [`ChainParameters`]: lightning::ln::channelmanager::ChainParameters
+/// [`ChannelManager::new`]: lightning::ln::channelmanager::ChannelManager::new
+// This prevents a possible race where an intermediate block is mined in between
+// when the channel manager and SpvClient are initialized, causing them to be
+// out of sync. When the SpvClient detects the next block, it feeds this new
+// block into the channel manager, but the channel manager is actually expecting
+// to hear about the intermediate block, thereby panicking with the message
+// "Blocks must be connected in chain-order - the connected header must build on
+// the last connected header."
+pub async fn validate_best_block_header_and_best_block<B: Deref>(block_source: B)
+-> BlockSourceResult<(ValidatedBlockHeader, BestBlock)>
+where
+	B::Target: BlockSource
+{
+	let (polled_best_block_hash, maybe_best_block_height) = block_source
+		.get_best_block()
+		.await?;
+	let best_block_header_data = block_source
+		.get_header(&polled_best_block_hash, maybe_best_block_height)
+		.await?;
+	let best_block_height = maybe_best_block_height.ok_or_else(||
+			BlockSourceError::persistent("block height missing")
+		)?;
+	let polled_best_block =
+		BestBlock::new(polled_best_block_hash, best_block_height);
+	let polled_chain_tip = best_block_header_data
+		.validate(polled_best_block_hash)?;
+
+	Ok((polled_chain_tip, polled_best_block))
 }
 
 /// Performs a one-time sync of chain listeners using a single *trusted* block source, bringing each
