@@ -21,43 +21,52 @@ jobs:
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: stable
             platform: macos-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: beta
             platform: macos-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: stable
             platform: windows-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: beta
             platform: windows-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: beta
             build-net-tokio: true
             build-no-std: true
             build-futures: true
+            build-tx-sync: true
           - toolchain: 1.41.1
             build-no-std: false
             test-log-variants: true
             build-futures: false
+            build-tx-sync: false
           - toolchain: 1.45.2
             build-net-old-tokio: true
             build-net-tokio: true
             build-no-std: false
             build-futures: true
+            build-tx-sync: false
             coverage: true
           - toolchain: 1.47.0
             build-futures: true
             build-no-std: true
+            build-tx-sync: false
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -108,6 +117,18 @@ jobs:
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client,rest-client
           RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features rpc-client,rest-client,tokio
+      - name: Build Transaction Sync Clients on Rust ${{ matrix.toolchain }} with features
+        if: "matrix.build-tx-sync && !matrix.coverage"
+        run: |
+          cd lightning-transaction-sync
+          cargo build --verbose --color always --features esplora-blocking
+          cargo build --verbose --color always --features esplora-async
+      - name: Build Transaction Sync Clients on Rust ${{ matrix.toolchain }} with features and full code-linking for coverage generation
+        if: "matrix.build-tx-sync && matrix.coverage"
+        run: |
+          cd lightning-transaction-sync
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features esplora-blocking
+          RUSTFLAGS="-C link-dead-code" cargo build --verbose --color always --features esplora-async
       - name: Test backtrace-debug builds on Rust ${{ matrix.toolchain }}
         if: "matrix.toolchain == 'stable'"
         run: |
@@ -349,7 +370,7 @@ jobs:
   linting:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.47.0
+      TOOLCHAIN: stable
     steps:
       - name: Checkout source code
         uses: actions/checkout@v3
