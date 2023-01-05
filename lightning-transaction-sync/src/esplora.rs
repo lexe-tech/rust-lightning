@@ -14,6 +14,7 @@ use esplora_client::r#async::AsyncClient;
 use esplora_client::blocking::BlockingClient;
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 use core::ops::Deref;
 
@@ -37,6 +38,8 @@ where
 	queued_outputs: Mutex<HashSet<WatchedOutput>>,
 	// Outputs that were previously processed, but must not be forgotten yet.
 	watched_outputs: Mutex<HashSet<WatchedOutput>>,
+	// Indicates whether we need to resync, e.g., after encountering an error.
+	pending_sync: AtomicBool,
 	// The tip hash observed during our last sync.
 	#[cfg(not(feature = "async-interface"))]
 	last_sync_hash: std::sync::Mutex<Option<BlockHash>>,
@@ -69,29 +72,40 @@ where
 		let mut tip_hash = maybe_await!(self.client.get_tip_hash())?;
 
 		loop {
-			let registrations_are_pending = self.process_queues();
+			let pending_sync = self.pending_sync.load(Ordering::SeqCst);
+			let pending_registrations = self.process_queues();
 			let tip_is_new = Some(tip_hash) != *locked_last_sync_hash;
 
 			// We loop until any registered transactions have been processed at least once, or the
 			// tip hasn't been updated during the last iteration.
-			if !registrations_are_pending && !tip_is_new {
+			if !pending_sync && !pending_registrations && !tip_is_new {
 				// Nothing to do.
 				break;
 			} else {
 				// Update the known tip to the newest one.
 				if tip_is_new {
 					// First check for any unconfirmed transactions and act on it immediately.
-					maybe_await!(self.sync_unconfirmed_transactions(&confirmables))?;
+					match maybe_await!(self.sync_unconfirmed_transactions(&confirmables)) {
+						Ok(()) => {},
+						Err(err) => {
+							// (Semi-)permanent failure, retry later.
+							log_error!(self.logger, "Failed during transaction sync, aborting.");
+							self.pending_sync.store(true, Ordering::SeqCst);
+							return Err(err);
+						}
+					}
 
 					match maybe_await!(self.sync_best_block_updated(&confirmables, &tip_hash)) {
 						Ok(()) => {}
 						Err(TxSyncError::Inconsistency) => {
 							// Immediately restart syncing when we encounter any inconsistencies.
 							log_debug!(self.logger, "Encountered inconsistency during transaction sync, restarting.");
+							self.pending_sync.store(true, Ordering::SeqCst);
 							continue;
 						}
 						Err(err) => {
 							// (Semi-)permanent failure, retry later.
+							self.pending_sync.store(true, Ordering::SeqCst);
 							return Err(err);
 						}
 					}
@@ -115,15 +129,18 @@ where
 					Err(TxSyncError::Inconsistency) => {
 						// Immediately restart syncing when we encounter any inconsistencies.
 						log_debug!(self.logger, "Encountered inconsistency during transaction sync, restarting.");
+						self.pending_sync.store(true, Ordering::SeqCst);
 						continue;
 					}
 					Err(err) => {
 						// (Semi-)permanent failure, retry later.
 						log_error!(self.logger, "Failed during transaction sync, aborting.");
+						self.pending_sync.store(true, Ordering::SeqCst);
 						return Err(err);
 					}
 				}
 				*locked_last_sync_hash = Some(tip_hash);
+				self.pending_sync.store(false, Ordering::SeqCst);
 			}
 		}
 		log_info!(self.logger, "Finished transaction sync.");
@@ -136,6 +153,7 @@ where
 		let queued_transactions = Mutex::new(HashSet::new());
 		let watched_outputs = Mutex::new(HashSet::new());
 		let queued_outputs = Mutex::new(HashSet::new());
+		let pending_sync = AtomicBool::new(false);
 		#[cfg(not(feature = "async-interface"))]
 		let last_sync_hash = Mutex::new(None);
 		#[cfg(feature = "async-interface")]
@@ -150,6 +168,7 @@ where
 			watched_transactions,
 			queued_outputs,
 			watched_outputs,
+			pending_sync,
 			last_sync_hash,
 			client,
 			logger,
