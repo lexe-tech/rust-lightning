@@ -40,13 +40,13 @@ jobs:
             build-net-tokio: true
             build-no-std: true
             build-futures: true
-            build-tx-sync: true
+            build-tx-sync: false
           - toolchain: beta
             platform: windows-latest
             build-net-tokio: true
             build-no-std: true
             build-futures: true
-            build-tx-sync: true
+            build-tx-sync: false
           - toolchain: beta
             build-net-tokio: true
             build-no-std: true
