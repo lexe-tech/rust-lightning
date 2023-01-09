@@ -50,14 +50,11 @@ fn get_electrsd() -> &'static ElectrsD {
 }
 
 fn generate_blocks_and_wait(num: usize) {
+	let _miner = MINER_LOCK.lock().unwrap();
 	let cur_height = get_bitcoind().client.get_block_count().unwrap();
-	generate_blocks(num);
-	wait_for_block(cur_height as usize + num);
-}
-
-fn generate_blocks(num: usize) {
 	let address = get_bitcoind().client.get_new_address(Some("test"), Some(AddressType::Legacy)).unwrap();
 	let _block_hashes = get_bitcoind().client.generate_to_address(num as u64, &address).unwrap();
+	wait_for_block(cur_height as usize + num);
 }
 
 fn wait_for_block(min_height: usize) {
@@ -92,7 +89,6 @@ where
 
 fn premine() {
 	PREMINE.get_or_init(|| {
-		let _miner = MINER_LOCK.lock().unwrap();
 		generate_blocks_and_wait(101);
 	});
 }
