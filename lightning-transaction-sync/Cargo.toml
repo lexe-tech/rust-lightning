@@ -14,7 +14,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["esplora-blocking"]
+default = []
 esplora-async = ["async-interface", "esplora-client/async", "futures"]
 esplora-blocking = ["esplora-client/blocking"]
 async-interface = []
