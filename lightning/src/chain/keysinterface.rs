@@ -1468,3 +1468,43 @@ impl PhantomKeysManager {
 pub fn dyn_sign() {
 	let _signer: Box<dyn BaseSign>;
 }
+
+#[cfg(test)]
+mod test {
+    use std::fmt::{self, Debug};
+
+    use proptest::strategy::{BoxedStrategy, Strategy};
+    use proptest::arbitrary::{any, Arbitrary};
+    use proptest::proptest;
+
+    use super::*;
+
+    impl Debug for KeysManager {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+            Ok(())
+        }
+    }
+
+    impl Arbitrary for KeysManager {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+            (any::<[u8; 32]>(), any::<u64>(), any::<u32>())
+                .prop_map(|(seed, secs, nanos)| {
+                    KeysManager::new(&seed, secs, nanos)
+                })
+                .boxed()
+        }
+    }
+
+    #[test]
+    fn derive_channel_keys_doesnt_panic() {
+        proptest!(|(
+            keys_manager in any::<KeysManager>(),
+            channel_value_sat in any::<u64>(),
+            params in any::<[u8; 32]>(),
+        )| {
+            keys_manager.derive_channel_keys(channel_value_sat, &params);
+        });
+    }
+}
