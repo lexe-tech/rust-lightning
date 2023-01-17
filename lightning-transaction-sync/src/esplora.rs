@@ -369,6 +369,16 @@ where
 
 		Ok(())
 	}
+
+    #[cfg(feature = "async-interface")]
+    pub fn client(&self) -> &AsyncClient {
+        &self.client
+    }
+
+    #[cfg(not(feature = "async-interface"))]
+    pub fn client(&self) -> &BlockingClient {
+        &self.client
+    }
 }
 
 struct ConfirmedTx {
