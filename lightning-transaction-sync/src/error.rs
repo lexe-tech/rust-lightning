@@ -3,7 +3,7 @@ use std::fmt;
 #[derive(Debug)]
 /// An error that possibly needs to be handled by the user.
 pub enum TxSyncError {
-	/// A transaction sync failed.
+	/// A transaction sync failed and needs to be retried eventually.
 	Failed,
 	/// An inconsisteny was encounterd during transaction sync.
 	Inconsistency,
