@@ -113,7 +113,8 @@ where
 
 				match maybe_await!(self.get_confirmed_transactions()) {
 					Ok((confirmed_txs, spent_outputs)) => {
-						// Double-check tip hash. If something changed, restart last-minute.
+						// Double-check the tip hash. If if it changed, a reorg happened since
+						// we started syncing and we need to restart last-minute.
 						let check_tip_hash = maybe_await!(self.client.get_tip_hash())?;
 						if check_tip_hash != tip_hash {
 							tip_hash = check_tip_hash;
