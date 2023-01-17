@@ -45,10 +45,7 @@ where
 	last_sync_hash: std::sync::Mutex<Option<BlockHash>>,
 	#[cfg(feature = "async-interface")]
 	last_sync_hash: futures::lock::Mutex<Option<BlockHash>>,
-	#[cfg(not(feature = "async-interface"))]
-	client: BlockingClient,
-	#[cfg(feature = "async-interface")]
-	client: AsyncClient,
+	client: EsploraClientType,
 	logger: L,
 }
 
@@ -150,6 +147,17 @@ where
 
 	/// Returns a new [`EsploraSyncClient`] object.
 	pub fn new(server_url: String, logger: L) -> Self {
+		let builder = Builder::new(&server_url);
+		#[cfg(not(feature = "async-interface"))]
+		let client = builder.build_blocking().unwrap();
+		#[cfg(feature = "async-interface")]
+		let client = builder.build_async().unwrap();
+
+		EsploraSyncClient::from_client(client, logger)
+	}
+
+	/// Returns a new [`EsploraSyncClient`] object using the given esplora client.
+	pub fn from_client(client: EsploraClientType, logger: L) -> Self {
 		let watched_transactions = Mutex::new(HashSet::new());
 		let queued_transactions = Mutex::new(HashSet::new());
 		let watched_outputs = Mutex::new(HashSet::new());
@@ -159,11 +167,6 @@ where
 		let last_sync_hash = Mutex::new(None);
 		#[cfg(feature = "async-interface")]
 		let last_sync_hash = futures::lock::Mutex::new(None);
-		let builder = Builder::new(&server_url);
-		#[cfg(not(feature = "async-interface"))]
-		let client = builder.build_blocking().unwrap();
-		#[cfg(feature = "async-interface")]
-		let client = builder.build_async().unwrap();
 		Self {
 			queued_transactions,
 			watched_transactions,
@@ -370,7 +373,19 @@ where
 
 		Ok(())
 	}
+
+	/// Returns a reference to the underlying esplora client.
+	pub fn client(&self) -> &EsploraClientType {
+		&self.client
+	}
 }
+
+/// The underlying client type.
+#[cfg(feature = "async-interface")]
+pub type EsploraClientType = AsyncClient;
+#[cfg(not(feature = "async-interface"))]
+pub type EsploraClientType = BlockingClient;
+
 
 struct ConfirmedTx {
 	tx: Transaction,

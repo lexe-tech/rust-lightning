@@ -11,6 +11,7 @@
 
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
 #[macro_use]
 extern crate bdk_macros;
 
