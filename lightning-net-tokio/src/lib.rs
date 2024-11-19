@@ -637,7 +637,7 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 	use std::time::Duration;
 
-	pub struct TestLogger();
+	pub struct TestLogger;
 	impl lightning::util::logger::Logger for TestLogger {
 		fn log(&self, record: lightning::util::logger::Record) {
 			println!(
@@ -840,7 +840,7 @@ mod tests {
 			a_msg_handler,
 			0,
 			&[1; 32],
-			Arc::new(TestLogger()),
+			Arc::new(TestLogger),
 			Arc::new(TestNodeSigner::new(a_key)),
 		));
 
@@ -863,7 +863,7 @@ mod tests {
 			b_msg_handler,
 			0,
 			&[2; 32],
-			Arc::new(TestLogger()),
+			Arc::new(TestLogger),
 			Arc::new(TestNodeSigner::new(b_key)),
 		));
 
@@ -925,7 +925,7 @@ mod tests {
 			a_msg_handler,
 			0,
 			&[1; 32],
-			Arc::new(TestLogger()),
+			Arc::new(TestLogger),
 			Arc::new(TestNodeSigner::new(a_key)),
 		));
 
