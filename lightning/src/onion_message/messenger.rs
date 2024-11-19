@@ -1546,7 +1546,7 @@ where
 		for ev in intercepted_msgs {
 			match handler.handle_event(ev) {
 				Ok(()) => num_handled_intercepted_events += 1,
-				Err(ReplayEvent ()) => {
+				Err(ReplayEvent) => {
 					handling_intercepted_msgs_failed = true;
 					break;
 				}
@@ -1568,7 +1568,7 @@ where
 		for ev in peer_connecteds {
 			match handler.handle_event(ev) {
 				Ok(()) => num_handled_peer_connecteds += 1,
-				Err(ReplayEvent ()) => {
+				Err(ReplayEvent) => {
 					self.event_notifier.notify();
 					break;
 				}

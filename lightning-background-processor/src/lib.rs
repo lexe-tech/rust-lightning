@@ -2309,7 +2309,7 @@ mod tests {
 				Ordering::Relaxed,
 			) {
 				first_event_send.send(event).unwrap();
-				return Err(ReplayEvent());
+				return Err(ReplayEvent);
 			}
 
 			second_event_send.send(event).unwrap();

@@ -621,7 +621,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`), but won't be persisted across restarts.
+	/// returning `Err(ReplayEvent)`), but won't be persisted across restarts.
 	///
 	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
 	/// [`ChannelManager::funding_transaction_generated`]: crate::ln::channelmanager::ChannelManager::funding_transaction_generated
@@ -708,7 +708,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
 	/// [`ChannelManager::claim_funds_with_known_custom_tlvs`]: crate::ln::channelmanager::ChannelManager::claim_funds_with_known_custom_tlvs
@@ -789,7 +789,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`ChannelManager::claim_funds`]: crate::ln::channelmanager::ChannelManager::claim_funds
 	PaymentClaimed {
@@ -840,7 +840,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event won't be replayed after failures-to-handle
-	/// (i.e., the event handler returning `Err(ReplayEvent ())`), and also won't be persisted
+	/// (i.e., the event handler returning `Err(ReplayEvent)`), and also won't be persisted
 	/// across restarts.
 	///
 	/// [`OnionMessage`]: msgs::OnionMessage
@@ -863,7 +863,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 	/// [`Refund`]: crate::offers::refund::Refund
@@ -894,7 +894,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	PaymentSent {
 		/// The `payment_id` passed to [`ChannelManager::send_payment`].
 		///
@@ -935,7 +935,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`Retry`]: crate::ln::channelmanager::Retry
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
@@ -962,7 +962,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	PaymentPathSuccessful {
 		/// The `payment_id` passed to [`ChannelManager::send_payment`].
 		///
@@ -990,7 +990,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`ChannelManager::abandon_payment`]: crate::ln::channelmanager::ChannelManager::abandon_payment
 	PaymentPathFailed {
@@ -1034,7 +1034,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	ProbeSuccessful {
 		/// The id returned by [`ChannelManager::send_probe`].
 		///
@@ -1051,7 +1051,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	ProbeFailed {
 		/// The id returned by [`ChannelManager::send_probe`].
 		///
@@ -1075,7 +1075,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be regenerated after restarts.
+	/// returning `Err(ReplayEvent)`) and will be regenerated after restarts.
 	///
 	/// [`ChannelManager::process_pending_htlc_forwards`]: crate::ln::channelmanager::ChannelManager::process_pending_htlc_forwards
 	PendingHTLCsForwardable {
@@ -1095,7 +1095,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`ChannelManager::get_intercept_scid`]: crate::ln::channelmanager::ChannelManager::get_intercept_scid
 	/// [`UserConfig::accept_intercept_htlcs`]: crate::util::config::UserConfig::accept_intercept_htlcs
@@ -1134,7 +1134,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`OutputSweeper`]: crate::util::sweep::OutputSweeper
 	SpendableOutputs {
@@ -1150,7 +1150,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	PaymentForwarded {
 		/// The channel id of the incoming channel between the previous node and us.
 		///
@@ -1215,7 +1215,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	ChannelPending {
 		/// The `channel_id` of the channel that is pending confirmation.
 		channel_id: ChannelId,
@@ -1248,7 +1248,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	ChannelReady {
 		/// The `channel_id` of the channel that is ready.
 		channel_id: ChannelId,
@@ -1278,7 +1278,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	ChannelClosed {
 		/// The `channel_id` of the channel which has been closed. Note that on-chain transactions
 		/// resolving the channel are likely still awaiting confirmation.
@@ -1328,7 +1328,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	DiscardFunding {
 		/// The channel_id of the channel which has been closed.
 		channel_id: ChannelId,
@@ -1346,7 +1346,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	///
 	/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
 	/// [`ChannelManager::force_close_without_broadcasting_txn`]: crate::ln::channelmanager::ChannelManager::force_close_without_broadcasting_txn
@@ -1411,7 +1411,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`) and will be persisted across restarts.
+	/// returning `Err(ReplayEvent)`) and will be persisted across restarts.
 	HTLCHandlingFailed {
 		/// The channel over which the HTLC was received.
 		prev_channel_id: ChannelId,
@@ -1427,7 +1427,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`), but will only be regenerated as needed after restarts.
+	/// returning `Err(ReplayEvent)`), but will only be regenerated as needed after restarts.
 	///
 	/// [`ChannelHandshakeConfig::negotiate_anchors_zero_fee_htlc_tx`]: crate::util::config::ChannelHandshakeConfig::negotiate_anchors_zero_fee_htlc_tx
 	BumpTransaction(BumpTransactionEvent),
@@ -1438,7 +1438,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`), but won't be persisted across restarts.
+	/// returning `Err(ReplayEvent)`), but won't be persisted across restarts.
 	///
 	/// [`OnionMessenger::new_with_offline_peer_interception`]: crate::onion_message::messenger::OnionMessenger::new_with_offline_peer_interception
 	OnionMessageIntercepted {
@@ -1455,7 +1455,7 @@ pub enum Event {
 	///
 	/// # Failure Behavior and Persistence
 	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
-	/// returning `Err(ReplayEvent ())`), but won't be persisted across restarts.
+	/// returning `Err(ReplayEvent)`), but won't be persisted across restarts.
 	///
 	/// [`OnionMessenger::new_with_offline_peer_interception`]: crate::onion_message::messenger::OnionMessenger::new_with_offline_peer_interception
 	OnionMessagePeerConnected {
@@ -2618,7 +2618,7 @@ pub trait MessageSendEventsProvider {
 /// and replay any unhandled events on startup. An [`Event`] is considered handled when
 /// [`process_pending_events`] returns `Ok(())`, thus handlers MUST fully handle [`Event`]s and
 /// persist any relevant changes to disk *before* returning `Ok(())`. In case of an error (e.g.,
-/// persistence failure) implementors should return `Err(ReplayEvent())`, signalling to the
+/// persistence failure) implementors should return `Err(ReplayEvent)`, signalling to the
 /// [`EventsProvider`] to replay unhandled events on the next invocation (generally immediately).
 /// Note that some events might not be replayed, please refer to the documentation for
 /// the individual [`Event`] variants for more detail.
@@ -2654,7 +2654,7 @@ pub trait EventsProvider {
 /// Depending on the type, LDK may ensure the event is persisted and will eventually be replayed.
 /// Please refer to the documentation of each [`Event`] variant for more details.
 #[derive(Clone, Copy, Debug)]
-pub struct ReplayEvent();
+pub struct ReplayEvent;
 
 /// A trait implemented for objects handling events from [`EventsProvider`].
 ///

@@ -575,7 +575,7 @@ where C::Target: chain::Filter,
 			match super::channelmonitor::process_events_body!(
 				self.monitors.read().unwrap().get(&funding_txo).map(|m| &m.monitor), ev, handler(ev).await) {
 				Ok(()) => {},
-				Err(ReplayEvent ()) => {
+				Err(ReplayEvent) => {
 					self.event_notifier.notify();
 				}
 			}
@@ -911,7 +911,7 @@ impl<ChannelSigner: EcdsaChannelSigner, C: Deref, T: Deref, F: Deref, L: Deref, 
 		for monitor_state in self.monitors.read().unwrap().values() {
 			match monitor_state.monitor.process_pending_events(&handler) {
 				Ok(()) => {},
-				Err(ReplayEvent ()) => {
+				Err(ReplayEvent) => {
 					self.event_notifier.notify();
 				}
 			}
