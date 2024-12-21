@@ -29,6 +29,7 @@
 
 use bitcoin::secp256k1::PublicKey;
 
+use lightning::ln::peer_handler::PeerHandleError;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -468,6 +469,86 @@ where
 	}
 }
 
+/// A version of [`setup_outbound`] with a reasonable API that also returns the
+/// `JoinHandle` to the caller.
+// XXX(max): Clean up and upstream
+pub fn setup_inbound_task<PM: Deref + 'static + Send + Sync + Clone>(
+	peer_manager: PM, stream: StdTcpStream,
+) -> Result<tokio::task::JoinHandle<()>, PeerHandleError>
+where
+	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
+{
+	let remote_addr = get_addr_from_stream(&stream);
+	let (reader, write_receiver, read_receiver, us) = Connection::new(stream);
+
+	let descriptor = SocketDescriptor::new(us.clone());
+	// Note that if this errors, we will skip socket_disconnected here, in
+	// accordance with the PeerManager requirements.
+	peer_manager.as_ref().new_inbound_connection(descriptor, remote_addr)?;
+
+	let handle = spawn_inherit(Connection::schedule_read(
+		peer_manager,
+		us,
+		reader,
+		read_receiver,
+		write_receiver,
+	));
+
+	Ok(handle)
+}
+
+/// A version of [`setup_outbound`] with a reasonable API that also returns the
+/// `JoinHandle` to the caller.
+// XXX(max): Clean up and upstream
+pub fn setup_outbound_task<PM: Deref + 'static + Send + Sync + Clone>(
+	peer_manager: PM, their_node_id: PublicKey, stream: StdTcpStream,
+) -> Result<tokio::task::JoinHandle<()>, PeerHandleError>
+where
+	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
+{
+	let remote_addr = get_addr_from_stream(&stream);
+	let (reader, mut write_receiver, read_receiver, us) = Connection::new(stream);
+	let descriptor = SocketDescriptor::new(us.clone());
+	// Note that if this errors, we will skip socket_disconnected here, in
+	// accordance with the PeerManager requirements.
+	let initial_send =
+		peer_manager.as_ref().new_outbound_connection(their_node_id, descriptor, remote_addr)?;
+
+	let handle = spawn_inherit(async move {
+		// We should essentially always have enough room in a TCP socket buffer to send the
+		// initial 10s of bytes. However, tokio running in single-threaded mode will always
+		// fail writes and wake us back up later to write. Thus, we handle a single
+		// std::task::Poll::Pending but still expect to write the full set of bytes at once
+		// and use a relatively tight timeout.
+		let send_fut = async {
+			loop {
+				match SocketDescriptor::new(us.clone()).send_data(&initial_send, true) {
+					v if v == initial_send.len() => break Ok(()),
+					0 => {
+						write_receiver.recv().await;
+						// In theory we could check for if we've been instructed to disconnect
+						// the peer here, but its OK to just skip it - we'll check for it in
+						// schedule_read prior to any relevant calls into RL.
+					},
+					_ => {
+						eprintln!("Failed to write first full message to socket!");
+						peer_manager
+							.as_ref()
+							.socket_disconnected(&SocketDescriptor::new(Arc::clone(&us)));
+						break Err(());
+					},
+				}
+			}
+		};
+		let timeout_send_fut = tokio::time::timeout(Duration::from_millis(100), send_fut);
+		if let Ok(Ok(())) = timeout_send_fut.await {
+			Connection::schedule_read(peer_manager, us, reader, read_receiver, write_receiver)
+				.await;
+		}
+	});
+
+	Ok(handle)
+}
 /// Process incoming messages and feed outgoing messages on a new connection made to the given
 /// socket address which is expected to be accepted by a peer with the given public key (by
 /// scheduling futures with tokio::spawn).
