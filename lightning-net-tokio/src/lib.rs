@@ -41,7 +41,6 @@ use lightning::ln::peer_handler::SocketDescriptor as LnSocketTrait;
 use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
-use std::net::TcpStream as StdTcpStream;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -280,7 +279,7 @@ impl Connection {
 	}
 
 	fn new(
-		stream: StdTcpStream,
+		stream: TcpStream,
 	) -> (Arc<TcpStream>, mpsc::Receiver<()>, mpsc::Receiver<()>, Arc<Mutex<Self>>) {
 		// We only ever need a channel of depth 1 here: if we returned a non-full write to the
 		// PeerManager, we will eventually get notified that there is room in the socket to write
@@ -292,8 +291,7 @@ impl Connection {
 		// we shove a value into the channel which comes after we've reset the read_paused bool to
 		// false.
 		let (read_waker, read_receiver) = mpsc::channel(1);
-		stream.set_nonblocking(true).unwrap();
-		let tokio_stream = Arc::new(TcpStream::from_std(stream).unwrap());
+		let tokio_stream = Arc::new(stream);
 
 		let id = ID_COUNTER.fetch_add(1, Ordering::AcqRel);
 		let writer = Some(Arc::clone(&tokio_stream));
@@ -309,7 +307,7 @@ impl Connection {
 	}
 }
 
-fn get_addr_from_stream(stream: &StdTcpStream) -> Option<SocketAddress> {
+fn get_addr_from_stream(stream: &TcpStream) -> Option<SocketAddress> {
 	match stream.peer_addr() {
 		Ok(SocketAddr::V4(sockaddr)) => {
 			Some(SocketAddress::TcpIpV4 { addr: sockaddr.ip().octets(), port: sockaddr.port() })
@@ -350,7 +348,7 @@ where
 /// futures are freed, though, because all processing futures are spawned with tokio::spawn, you do
 /// not need to poll the provided future in order to make progress.
 pub fn setup_inbound<PM: Deref + 'static + Send + Sync + Clone>(
-	peer_manager: PM, stream: StdTcpStream,
+	peer_manager: PM, stream: TcpStream,
 ) -> impl std::future::Future<Output = ()>
 where
 	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
@@ -360,7 +358,7 @@ where
 
 /// A version of [`setup_inbound`] which allows passing a custom [`Executor`].
 pub fn setup_inbound_with_executor<E, PM: Deref + 'static + Send + Sync + Clone>(
-	executor: E, peer_manager: PM, stream: StdTcpStream,
+	executor: E, peer_manager: PM, stream: TcpStream,
 ) -> impl std::future::Future<Output = ()>
 where
 	E: Executor<Pin<Box<dyn Future<Output = ()> + Send>>> + Send + Sync + Clone + 'static,
@@ -415,7 +413,7 @@ where
 /// futures are freed, though, because all processing futures are spawned with tokio::spawn, you do
 /// not need to poll the provided future in order to make progress.
 pub fn setup_outbound<PM: Deref + 'static + Send + Sync + Clone>(
-	peer_manager: PM, their_node_id: PublicKey, stream: StdTcpStream,
+	peer_manager: PM, their_node_id: PublicKey, stream: TcpStream,
 ) -> impl std::future::Future<Output = ()>
 where
 	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
@@ -425,7 +423,7 @@ where
 
 /// A version of [`setup_outbound`] which allows passing a custom [`Executor`].
 pub fn setup_outbound_with_executor<E, PM: Deref + 'static + Send + Sync + Clone>(
-	executor: E, peer_manager: PM, their_node_id: PublicKey, stream: StdTcpStream,
+	executor: E, peer_manager: PM, their_node_id: PublicKey, stream: TcpStream,
 ) -> impl std::future::Future<Output = ()>
 where
 	E: Executor<Pin<Box<dyn Future<Output = ()> + Send>>> + Send + Sync + Clone + 'static,
@@ -523,7 +521,7 @@ pub async fn connect_outbound<PM: Deref + 'static + Send + Sync + Clone>(
 where
 	PM::Target: APeerManager<Descriptor = SocketDescriptor>,
 {
-	let connect_fut = async { TcpStream::connect(&addr).await.map(|s| s.into_std().unwrap()) };
+	let connect_fut = TcpStream::connect(&addr);
 	if let Ok(Ok(stream)) = time::timeout(Duration::from_secs(10), connect_fut).await {
 		Some(setup_outbound(peer_manager, their_node_id, stream))
 	} else {
@@ -686,6 +684,7 @@ mod tests {
 	use lightning::routing::gossip::NodeId;
 	use lightning::util::test_utils::TestNodeSigner;
 
+	use tokio::net::{TcpListener, TcpStream};
 	use tokio::sync::mpsc;
 
 	use std::mem;
@@ -852,19 +851,37 @@ mod tests {
 		}
 	}
 
-	fn make_tcp_connection() -> (std::net::TcpStream, std::net::TcpStream) {
-		if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:9735") {
-			(std::net::TcpStream::connect("127.0.0.1:9735").unwrap(), listener.accept().unwrap().0)
-		} else if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:19735") {
-			(std::net::TcpStream::connect("127.0.0.1:19735").unwrap(), listener.accept().unwrap().0)
-		} else if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:9997") {
-			(std::net::TcpStream::connect("127.0.0.1:9997").unwrap(), listener.accept().unwrap().0)
-		} else if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:9998") {
-			(std::net::TcpStream::connect("127.0.0.1:9998").unwrap(), listener.accept().unwrap().0)
-		} else if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:9999") {
-			(std::net::TcpStream::connect("127.0.0.1:9999").unwrap(), listener.accept().unwrap().0)
-		} else if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:46926") {
-			(std::net::TcpStream::connect("127.0.0.1:46926").unwrap(), listener.accept().unwrap().0)
+	async fn make_tcp_connection() -> (TcpStream, TcpStream) {
+		if let Ok(listener) = TcpListener::bind("127.0.0.1:9735").await {
+			(
+				TcpStream::connect("127.0.0.1:9735").await.unwrap(),
+				listener.accept().await.unwrap().0,
+			)
+		} else if let Ok(listener) = TcpListener::bind("127.0.0.1:19735").await {
+			(
+				TcpStream::connect("127.0.0.1:19735").await.unwrap(),
+				listener.accept().await.unwrap().0,
+			)
+		} else if let Ok(listener) = TcpListener::bind("127.0.0.1:9997").await {
+			(
+				TcpStream::connect("127.0.0.1:9997").await.unwrap(),
+				listener.accept().await.unwrap().0,
+			)
+		} else if let Ok(listener) = TcpListener::bind("127.0.0.1:9998").await {
+			(
+				TcpStream::connect("127.0.0.1:9998").await.unwrap(),
+				listener.accept().await.unwrap().0,
+			)
+		} else if let Ok(listener) = TcpListener::bind("127.0.0.1:9999").await {
+			(
+				TcpStream::connect("127.0.0.1:9999").await.unwrap(),
+				listener.accept().await.unwrap().0,
+			)
+		} else if let Ok(listener) = TcpListener::bind("127.0.0.1:46926").await {
+			(
+				TcpStream::connect("127.0.0.1:46926").await.unwrap(),
+				listener.accept().await.unwrap().0,
+			)
 		} else {
 			panic!("Failed to bind to v4 localhost on common ports");
 		}
@@ -927,7 +944,7 @@ mod tests {
 		// address. This may not always be the case in containers and the like, so if this test is
 		// failing for you check that you have a loopback interface and it is configured with
 		// 127.0.0.1.
-		let (conn_a, conn_b) = make_tcp_connection();
+		let (conn_a, conn_b) = make_tcp_connection().await;
 
 		let fut_a = super::setup_outbound(Arc::clone(&a_manager), b_pub, conn_a);
 		let fut_b = super::setup_inbound(b_manager, conn_b);
@@ -987,11 +1004,11 @@ mod tests {
 
 		// Make two connections, one for an inbound and one for an outbound connection
 		let conn_a = {
-			let (conn_a, _) = make_tcp_connection();
+			let (conn_a, _) = make_tcp_connection().await;
 			conn_a
 		};
 		let conn_b = {
-			let (_, conn_b) = make_tcp_connection();
+			let (_, conn_b) = make_tcp_connection().await;
 			conn_b
 		};
 
